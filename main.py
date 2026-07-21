@@ -3,7 +3,7 @@ import logging
 import os
 import random
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
-from aiogram.filters import Command
+from aiogram.filters import Command, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -129,7 +129,13 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 # === ПЕРСОНАЛЬНЫЕ ДУЭЛИ В ЧАТЕ (ОТВЕТОМ НА СООБЩЕНИЕ) ===
-@router.message(F.text.lower().startswith("дуэль") | F.text.lower().startswith("дуель") | Command("duel"))
+@router.message(
+    or_f(
+        Command("duel"),
+        F.text.lower().startswith("дуэль"),
+        F.text.lower().startswith("дуель")
+    )
+)
 async def create_direct_duel(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.answer(
@@ -281,7 +287,13 @@ async def decline_direct_duel(callback: CallbackQuery):
 
 
 # === ПЕРЕВОД ДЕНЕГ ИГРОКУ ===
-@router.message(F.text.lower().startswith("передать") | F.text.lower().startswith("pay") | F.text.lower().startswith("give"))
+@router.message(
+    or_f(
+        F.text.lower().startswith("передать"),
+        F.text.lower().startswith("pay"),
+        F.text.lower().startswith("give")
+    )
+)
 async def transfer_money_cmd(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.answer(
@@ -559,7 +571,7 @@ async def crash_custom_bet_start(callback: CallbackQuery, state: FSMContext):
 async def crash_custom_bet_process(message: Message, state: FSMContext):
     await state.clear()
 
-    if not message.text.isdigit():
+    if not message.text or not message.text.isdigit():
         await message.answer("❌ Сумма должна быть целым положительным числом!")
         return
 
@@ -968,7 +980,7 @@ async def open_case_handler(callback: CallbackQuery):
     item = open_case(case_key)
 
     if item:
-        await db.add_item_to_inventory(callback.from_user.id, item["name"], item["price"])
+        await db.add_item_to_inventory(callback.from_user.id, item["name"], item["price"], item.get("rarity", "common"))
         rarity_info = RARITIES.get(item.get("rarity", "common"), {})
         color_icon = rarity_info.get("icon", "⚪")
 
@@ -988,7 +1000,6 @@ async def open_case_handler(callback: CallbackQuery):
 @router.callback_query(F.data == "inventory")
 async def show_inventory(callback: CallbackQuery):
     items = await db.get_inventory(callback.from_user.id)
-    user = await db.get_user(callback.from_user.id)
 
     if not items:
         await callback.message.edit_text(
@@ -999,11 +1010,11 @@ async def show_inventory(callback: CallbackQuery):
         await callback.answer()
         return
 
-    total_val = sum(i.get("price", 0) for i in items)
+    total_val = sum(i.get("item_price", 0) for i in items)
     text = f"🎒 <b>ТВОЙ ИНВЕНТАРЬ</b> (Всего: {len(items)} шт. | ~{total_val}💰)\n\n"
 
     for idx, item in enumerate(items[:10], start=1):
-        text += f"{idx}. <b>{item['name']}</b> — {item['price']}💰\n"
+        text += f"{idx}. <b>{item['item_name']}</b> — {item['item_price']}💰\n"
 
     if len(items) > 10:
         text += f"\n<i>... и еще {len(items) - 10} предметов.</i>"
@@ -1019,7 +1030,7 @@ async def admin_give_money(message: Message):
         return
 
     parts = message.text.split()
-    if len(parts) < 3:
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].lstrip('-').isdigit():
         await message.answer("⚠️ Использование: <code>/give [user_id] [amount]</code>")
         return
 
@@ -1033,10 +1044,10 @@ async def admin_give_money(message: Message):
 # === ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ===
 async def main():
     logger.info("Запуск базы данных...")
-    await db.init_db()  # <-- Инициализируем таблицы базы данных
+    await db.init_db()  # Инициализация всех таблиц базы данных
 
     logger.info("Запуск фоновой рекламы...")
-    asyncio.create_task(ad_loop(bot))  # <-- Запуск фоновой рекламы
+    asyncio.create_task(ad_loop(bot))
 
     logger.info("Бот успешно запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
