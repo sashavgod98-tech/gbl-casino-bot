@@ -209,6 +209,9 @@ class Database:
             )
             await db.commit()
 
+    async def add_item_to_inventory(self, user_id: int, name: str, price: int, rarity: str = "common"):
+        await self.add_item(user_id, name, rarity, price)
+
     async def get_inventory(self, user_id: int):
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -241,12 +244,23 @@ class Database:
         return 0
 
     # === ТОПЫ ===
-    async def get_top_balance(self, limit: int = 10):
+    async def get_top_users(self, top_type: str = "balance", limit: int = 10):
+        column_map = {
+            "balance": "balance",
+            "won": "total_won",
+            "spent": "total_spent"
+        }
+        target_col = column_map.get(top_type, "balance")
+
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT username, prefix, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,)) as cursor:
+            query = f"SELECT username, prefix, {target_col} as {top_type} FROM users ORDER BY {target_col} DESC LIMIT ?"
+            async with db.execute(query, (limit,)) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def get_top_balance(self, limit: int = 10):
+        return await self.get_top_users("balance", limit)
 
     async def get_top_inventory(self, limit: int = 10):
         async with aiosqlite.connect(self.db_path) as db:
@@ -292,7 +306,7 @@ class Database:
             await db.commit()
             return reward
 
-    # === ДУЭЛИ (НОВЫЙ БЛОК) ===
+    # === ДУЭЛИ ===
     async def create_duel(self, creator_id: int, bet: int, creator_choice: str):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
