@@ -4,9 +4,7 @@ import aiosqlite
 
 DB_PATH = "casino_bot.db"
 
-
 class Database:
-
   def __init__(self):
     self.path = DB_PATH
 
@@ -54,62 +52,61 @@ class Database:
                     used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+      # Таблица для рассылок и авто-рекламы
+      await db.execute("""
+                CREATE TABLE IF NOT EXISTS active_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    type TEXT
+                )
+            """)
 
-      # Проверка и добавление колонки prefix для старых БД
       cursor = await db.execute("PRAGMA table_info(users)")
       cols = [col[1] for col in await cursor.fetchall()]
       if "prefix" not in cols:
-        await db.execute(
-            "ALTER TABLE users ADD COLUMN prefix TEXT DEFAULT ''"
-        )
+        await db.execute("ALTER TABLE users ADD COLUMN prefix TEXT DEFAULT ''")
 
       await db.commit()
-      print("✅ База данных инициализирована и защищена")
+
+  # РЕГИСТРАЦИЯ ЧАТОВ ДЛЯ РАССЫЛКИ
+  async def register_chat(self, chat_id: int, chat_type: str):
+    async with aiosqlite.connect(self.path) as db:
+      await db.execute("INSERT OR IGNORE INTO active_chats (chat_id, type) VALUES (?, ?)", (chat_id, chat_type))
+      await db.commit()
+
+  async def get_all_chats(self):
+    async with aiosqlite.connect(self.path) as db:
+      db.row_factory = aiosqlite.Row
+      cursor = await db.execute("SELECT * FROM active_chats")
+      return await cursor.fetchall()
 
   async def get_user(self, tg_id: int):
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT * FROM users WHERE tg_id = ?", (tg_id,)
-      )
+      cursor = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
       return await cursor.fetchone()
 
   async def create_user(self, tg_id: int, username: str):
     ref_code = str(uuid.uuid4())[:8].upper()
-    clean_username = (
-        f"@{username}" if username and not username.startswith("@") else username
-    )
+    clean_username = f"@{username}" if username and not username.startswith("@") else username
     async with aiosqlite.connect(self.path) as db:
       await db.execute(
-          "INSERT INTO users (tg_id, username, balance, ref_code) VALUES (?,"
-          " ?, 1000, ?)",
+          "INSERT INTO users (tg_id, username, balance, ref_code) VALUES (?, ?, 1000, ?)",
           (tg_id, clean_username or "Игрок", ref_code),
       )
       await db.commit()
 
   async def update_balance(self, tg_id: int, amount: int):
     async with aiosqlite.connect(self.path) as db:
-      await db.execute(
-          "UPDATE users SET balance = balance + ? WHERE tg_id = ?",
-          (amount, tg_id),
-      )
+      await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id))
       if amount > 0:
-        await db.execute(
-            "UPDATE users SET total_won = total_won + ? WHERE tg_id = ?",
-            (amount, tg_id),
-        )
+        await db.execute("UPDATE users SET total_won = total_won + ? WHERE tg_id = ?", (amount, tg_id))
       else:
-        await db.execute(
-            "UPDATE users SET total_spent = total_spent + ? WHERE tg_id = ?",
-            (abs(amount), tg_id),
-        )
+        await db.execute("UPDATE users SET total_spent = total_spent + ? WHERE tg_id = ?", (abs(amount), tg_id))
       await db.commit()
 
   async def set_prefix(self, tg_id: int, prefix: str):
     async with aiosqlite.connect(self.path) as db:
-      await db.execute(
-          "UPDATE users SET prefix = ? WHERE tg_id = ?", (prefix, tg_id)
-      )
+      await db.execute("UPDATE users SET prefix = ? WHERE tg_id = ?", (prefix, tg_id))
       await db.commit()
 
   async def can_claim_daily(self, tg_id: int) -> bool:
@@ -122,8 +119,7 @@ class Database:
   async def claim_daily(self, tg_id: int):
     async with aiosqlite.connect(self.path) as db:
       await db.execute(
-          "UPDATE users SET last_daily = ?, balance = balance + 2500 WHERE"
-          " tg_id = ?",
+          "UPDATE users SET last_daily = ?, balance = balance + 2500 WHERE tg_id = ?",
           (datetime.now().isoformat(), tg_id),
       )
       await db.commit()
@@ -131,87 +127,58 @@ class Database:
   async def add_item(self, tg_id: int, name: str, rarity: str, price: int):
     async with aiosqlite.connect(self.path) as db:
       await db.execute(
-          "INSERT INTO inventory (user_id, item_name, item_rarity, item_price)"
-          " VALUES (?, ?, ?, ?)",
+          "INSERT INTO inventory (user_id, item_name, item_rarity, item_price) VALUES (?, ?, ?, ?)",
           (tg_id, name, rarity, price),
       )
-      await db.execute(
-          "UPDATE users SET inventory_value = inventory_value + ? WHERE tg_id"
-          " = ?",
-          (price, tg_id),
-      )
+      await db.execute("UPDATE users SET inventory_value = inventory_value + ? WHERE tg_id = ?", (price, tg_id))
       await db.commit()
 
   async def get_inventory(self, tg_id: int):
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT * FROM inventory WHERE user_id = ? ORDER BY item_price DESC",
-          (tg_id,),
-      )
+      cursor = await db.execute("SELECT * FROM inventory WHERE user_id = ? ORDER BY item_price DESC", (tg_id,))
       return await cursor.fetchall()
 
   async def sell_item(self, item_id: int, tg_id: int) -> int:
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT item_price FROM inventory WHERE id = ? AND user_id = ?",
-          (item_id, tg_id),
-      )
+      cursor = await db.execute("SELECT item_price FROM inventory WHERE id = ? AND user_id = ?", (item_id, tg_id))
       item = await cursor.fetchone()
-      if not item:
-        return 0
+      if not item: return 0
       price = item["item_price"]
       await db.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
-      await db.execute(
-          "UPDATE users SET balance = balance + ?, inventory_value ="
-          " inventory_value - ? WHERE tg_id = ?",
-          (price, price, tg_id),
-      )
+      await db.execute("UPDATE users SET balance = balance + ?, inventory_value = inventory_value - ? WHERE tg_id = ?", (price, price, tg_id))
       await db.commit()
       return price
 
   async def sell_all_items(self, tg_id: int) -> int:
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT SUM(item_price) as total FROM inventory WHERE user_id = ?",
-          (tg_id,),
-      )
+      cursor = await db.execute("SELECT SUM(item_price) as total FROM inventory WHERE user_id = ?", (tg_id,))
       row = await cursor.fetchone()
       total_price = row["total"] or 0
-
       if total_price > 0:
         await db.execute("DELETE FROM inventory WHERE user_id = ?", (tg_id,))
-        await db.execute(
-            "UPDATE users SET balance = balance + ?, inventory_value = 0 WHERE"
-            " tg_id = ?",
-            (total_price, tg_id),
-        )
+        await db.execute("UPDATE users SET balance = balance + ?, inventory_value = 0 WHERE tg_id = ?", (total_price, tg_id))
         await db.commit()
       return total_price
 
   async def get_top_balance(self, limit: int = 10):
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT * FROM users ORDER BY balance DESC LIMIT ?", (limit,)
-      )
+      cursor = await db.execute("SELECT * FROM users ORDER BY balance DESC LIMIT ?", (limit,))
       return await cursor.fetchall()
 
   async def get_top_inventory(self, limit: int = 10):
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT * FROM users ORDER BY inventory_value DESC LIMIT ?", (limit,)
-      )
+      cursor = await db.execute("SELECT * FROM users ORDER BY inventory_value DESC LIMIT ?", (limit,))
       return await cursor.fetchall()
 
   async def add_promo_code(self, code: str, reward: int, max_uses: int = 1):
     async with aiosqlite.connect(self.path) as db:
       await db.execute(
-          "INSERT OR REPLACE INTO promo_codes (code, reward, max_uses) VALUES"
-          " (?, ?, ?)",
+          "INSERT OR REPLACE INTO promo_codes (code, reward, max_uses) VALUES (?, ?, ?)",
           (code.upper(), reward, max_uses),
       )
       await db.commit()
@@ -220,48 +187,26 @@ class Database:
     code = code.upper()
     async with aiosqlite.connect(self.path) as db:
       db.row_factory = aiosqlite.Row
-      cursor = await db.execute(
-          "SELECT id FROM used_promos WHERE user_id = ? AND promo_code = ?",
-          (user_id, code),
-      )
-      if await cursor.fetchone():
-        return False
-      cursor = await db.execute(
-          "SELECT * FROM promo_codes WHERE code = ? AND is_active = 1 AND"
-          " current_uses < max_uses",
-          (code,),
-      )
+      cursor = await db.execute("SELECT id FROM used_promos WHERE user_id = ? AND promo_code = ?", (user_id, code))
+      if await cursor.fetchone(): return False
+      cursor = await db.execute("SELECT * FROM promo_codes WHERE code = ? AND is_active = 1 AND current_uses < max_uses", (code,))
       promo = await cursor.fetchone()
-      if not promo:
-        return False
-      await db.execute(
-          "UPDATE users SET balance = balance + ? WHERE tg_id = ?",
-          (promo["reward"], user_id),
-      )
-      await db.execute(
-          "UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code"
-          " = ?",
-          (code,),
-      )
-      await db.execute(
-          "INSERT INTO used_promos (user_id, promo_code) VALUES (?, ?)",
-          (user_id, code),
-      )
+      if not promo: return False
+      await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (promo["reward"], user_id))
+      await db.execute("UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code = ?", (code,))
+      await db.execute("INSERT INTO used_promos (user_id, promo_code) VALUES (?, ?)", (user_id, code))
       await db.commit()
       return promo["reward"]
 
   async def get_referral_link(self, tg_id: int):
     user = await self.get_user(tg_id)
-    if not user or not user["ref_code"]:
-      return None
+    if not user or not user["ref_code"]: return None
     return f"https://t.me/gbl_games_bot?start={user['ref_code']}"
 
   async def get_user_rank(self, tg_id: int):
     users = await self.get_top_balance(100)
     for i, user in enumerate(users, 1):
-      if user["tg_id"] == tg_id:
-        return i
+      if user["tg_id"] == tg_id: return i
     return None
-
 
 db = Database()
