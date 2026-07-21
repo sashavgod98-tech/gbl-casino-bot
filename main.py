@@ -41,7 +41,7 @@ direct_duels = {}
 direct_duel_counter = 1
 
 
-# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ И ОБНОВЛЕНИЕ НИКОВ ===
+# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ, ТРЕКИНГ ЧАТОВ И ОБНОВЛЕНИЕ НИКОВ ===
 class AutoRegisterMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user_obj = None
@@ -858,7 +858,7 @@ async def duel_list(callback: CallbackQuery):
         await callback.answer()
         return
 
-    text = "📋 <b>Активные дуэли:</b>\n\n"
+    text = "📋 <b>Активные дуэлей:</b>\n\n"
     kb_buttons = []
 
     if isinstance(duels, dict):
@@ -905,29 +905,60 @@ async def duel_join_handler(callback: CallbackQuery):
 
     user = await db.get_user(callback.from_user.id)
     if not user or user["balance"] < duel["bet"]:
-        await callback.answer(f"❌ Нужно {duel['bet']}💰 для участия!", show_alert=True)
+        await callback.answer(f"❌ Нужно {duel['bet']}💰", show_alert=True)
         return
 
-    # Списываем баланс и подключаем к дуэли
+    # Списание ставки
     await db.update_balance(callback.from_user.id, -duel["bet"])
-    
+
     try:
-        res = join_duel(duel_id, callback.from_user.id)
+        # Проведение дуэли через games.py
+        res = resolve_duel(duel_id, callback.from_user.id)
         
-        # Начисляем выигрыш
+        # Начисляем победителю
         await db.update_balance(res["winner_id"], res["prize"])
         
         winner = await db.get_user(res["winner_id"])
         loser = await db.get_user(res["loser_id"])
-        
-        await callback.message.edit_text(
+
+        text = (
             f"⚔️ <b>ДУЭЛЬ СОСТОЯЛАСЬ!</b>\n\n"
             f"🏆 Победитель: <b>{winner['username']}</b> (+{res['prize']}💰)!\n"
-            f"💀 Повержен: <b>{loser['username']}</b>",
-            reply_markup=main_menu_kb()
+            f"💀 Повержен: <b>{loser['username']}</b>"
         )
-    except Exception as e:
-        logger.error(f"Ошибка в дуэли: {e}")
-        await callback.answer("❌ Произошла ошибка при проведении дуэли.", show_alert=True)
         
+        await callback.message.edit_text(text, reply_markup=main_menu_kb())
+        
+        # Пытаемся уведомить игроков в ЛС (если бот может им писать)
+        try:
+            if res["winner_id"] == callback.from_user.id:
+                await bot.send_message(res["loser_id"], f"💀 Игрок {winner['username']} принял твою дуэль и победил.")
+            else:
+                await bot.send_message(res["loser_id"], f"💀 Ты проиграл дуэль против {winner['username']}.")
+                await bot.send_message(res["winner_id"], f"🎉 Ты победил в дуэли! Твой выигрыш: +{res['prize']}💰")
+        except Exception as e:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Error resolving duel: {e}")
+        await callback.message.edit_text("❌ Произошла ошибка при завершении дуэли.", reply_markup=main_menu_kb())
+
     await callback.answer()
+
+
+# === ЗАПУСК БОТА ===
+async def main():
+    logger.info("Бот запускается...")
+    
+    # Запуск фоновой задачи рассылки (рекламы)
+    asyncio.create_task(ad_loop(bot))
+    
+    # Сбрасываем webhook (если был установлен) и запускаем polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную.")
