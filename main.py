@@ -3,7 +3,7 @@ import logging
 import os
 import random
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
-from aiogram.filters import Command, or_f
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -129,13 +129,8 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 # === ПЕРСОНАЛЬНЫЕ ДУЭЛИ В ЧАТЕ (ОТВЕТОМ НА СООБЩЕНИЕ) ===
-@router.message(
-    or_f(
-        Command("duel"),
-        F.text.lower().startswith("дуэль"),
-        F.text.lower().startswith("дуель")
-    )
-)
+@router.message(Command("duel"))
+@router.message(F.text & F.text.lower().startswith(("дуэль", "дуель")))
 async def create_direct_duel(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.answer(
@@ -287,13 +282,9 @@ async def decline_direct_duel(callback: CallbackQuery):
 
 
 # === ПЕРЕВОД ДЕНЕГ ИГРОКУ ===
-@router.message(
-    or_f(
-        F.text.lower().startswith("передать"),
-        F.text.lower().startswith("pay"),
-        F.text.lower().startswith("give")
-    )
-)
+@router.message(Command("pay"))
+@router.message(Command("give"))
+@router.message(F.text & F.text.lower().startswith(("передать", "pay", "give")))
 async def transfer_money_cmd(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.answer(
@@ -905,157 +896,38 @@ async def duel_join_handler(callback: CallbackQuery):
     duel = active_duels.get(duel_id)
 
     if not duel:
-        await callback.answer("❌ Дуэль не найдена", show_alert=True)
+        await callback.answer("❌ Дуэль не найдена или уже завершена", show_alert=True)
         return
 
     if duel.get("creator_id") == callback.from_user.id:
-        await callback.answer("❌ Нельзя драться с самим собой!", show_alert=True)
+        await callback.answer("❌ Нельзя играть с самим собой!", show_alert=True)
         return
 
     user = await db.get_user(callback.from_user.id)
     if not user or user["balance"] < duel["bet"]:
-        await callback.answer(f"❌ Нужно {duel['bet']}💰", show_alert=True)
+        await callback.answer(f"❌ Нужно {duel['bet']}💰 для участия!", show_alert=True)
         return
 
+    # Списываем баланс и подключаем к дуэли
     await db.update_balance(callback.from_user.id, -duel["bet"])
-
+    
     try:
-        join_duel(duel_id, callback.from_user.id, user["username"])
-    except Exception:
-        join_duel(duel_id, callback.from_user.id)
-
-    res = resolve_duel(duel_id)
-
-    if isinstance(res, tuple):
-        winner_id, winner_name, loser_name, win_amount = res
-        await db.update_balance(winner_id, win_amount)
-        await callback.message.edit_text(
-            f"⚔️ <b>ДУЭЛЬ ЗАВЕРШЕНА!</b>\n\n"
-            f"🏆 Победитель: <b>{winner_name}</b> (+{win_amount}💰)!\n"
-            f"💀 Повержен: <b>{loser_name}</b>",
-            reply_markup=main_menu_kb()
-        )
-    else:
+        res = join_duel(duel_id, callback.from_user.id)
+        
+        # Начисляем выигрыш
         await db.update_balance(res["winner_id"], res["prize"])
+        
         winner = await db.get_user(res["winner_id"])
         loser = await db.get_user(res["loser_id"])
+        
         await callback.message.edit_text(
-            f"🏆 <b>Итоги Дуэли #{duel_id}</b>\n\n"
-            f"🪙 Монетка упала на сторону: <b>{winner['username']}</b>!\n"
-            f"💰 Выигрыш: <b>+{res['prize']}💰</b>\n"
+            f"⚔️ <b>ДУЭЛЬ СОСТОЯЛАСЬ!</b>\n\n"
+            f"🏆 Победитель: <b>{winner['username']}</b> (+{res['prize']}💰)!\n"
             f"💀 Повержен: <b>{loser['username']}</b>",
             reply_markup=main_menu_kb()
         )
+    except Exception as e:
+        logger.error(f"Ошибка в дуэли: {e}")
+        await callback.answer("❌ Произошла ошибка при проведении дуэли.", show_alert=True)
+        
     await callback.answer()
-
-
-# === КЕЙСЫ И ИНВЕНТАРЬ ===
-@router.callback_query(F.data == "cases")
-async def show_cases_menu(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "📦 <b>МАГАЗИН КЕЙСОВ</b>\n\n"
-        "Выбери кейс для открытия и попытай удачу выбить редкий предмет!",
-        reply_markup=cases_kb()
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("open_case_"))
-async def open_case_handler(callback: CallbackQuery):
-    case_key = callback.data.replace("open_case_", "")
-    case_data = CASES.get(case_key)
-
-    if not case_data:
-        await callback.answer("❌ Кейс не найден!", show_alert=True)
-        return
-
-    price = case_data["price"]
-    user = await db.get_user(callback.from_user.id)
-
-    if not user or user["balance"] < price:
-        await callback.answer(f"❌ Недостаточно денег! Нужно {price}💰", show_alert=True)
-        return
-
-    await db.update_balance(callback.from_user.id, -price)
-    item = open_case(case_key)
-
-    if item:
-        await db.add_item_to_inventory(callback.from_user.id, item["name"], item["price"], item.get("rarity", "common"))
-        rarity_info = RARITIES.get(item.get("rarity", "common"), {})
-        color_icon = rarity_info.get("icon", "⚪")
-
-        await callback.message.edit_text(
-            f"🎉 <b>ТЫ ОТКРЫЛ {case_data['name'].upper()}!</b>\n\n"
-            f"Вам выпал предмет: <b>{color_icon} {item['name']}</b>\n"
-            f"💵 Стоимость: <b>{item['price']}💰</b>\n\n"
-            f"Предмет сохранен в твой инвентарь!",
-            reply_markup=cases_kb()
-        )
-    else:
-        await callback.answer("❌ Ошибка при открытии кейса!", show_alert=True)
-
-    await callback.answer()
-
-
-@router.callback_query(F.data == "inventory")
-async def show_inventory(callback: CallbackQuery):
-    items = await db.get_inventory(callback.from_user.id)
-
-    if not items:
-        await callback.message.edit_text(
-            "🎒 <b>Твой инвентарь пуст.</b>\n"
-            "Открывай кейсы, чтобы получить редкие предметы!",
-            reply_markup=inventory_kb()
-        )
-        await callback.answer()
-        return
-
-    total_val = sum(i.get("item_price", 0) for i in items)
-    text = f"🎒 <b>ТВОЙ ИНВЕНТАРЬ</b> (Всего: {len(items)} шт. | ~{total_val}💰)\n\n"
-
-    for idx, item in enumerate(items[:10], start=1):
-        text += f"{idx}. <b>{item['item_name']}</b> — {item['item_price']}💰\n"
-
-    if len(items) > 10:
-        text += f"\n<i>... и еще {len(items) - 10} предметов.</i>"
-
-    await callback.message.edit_text(text, reply_markup=inventory_kb())
-    await callback.answer()
-
-
-# === АДМИН КОМАНДА ДЛЯ ВЫДАЧИ БАЛАНСА ===
-@router.message(Command("give"))
-async def admin_give_money(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.split()
-    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].lstrip('-').isdigit():
-        await message.answer("⚠️ Использование: <code>/give [user_id] [amount]</code>")
-        return
-
-    target_id = int(parts[1])
-    amount = int(parts[2])
-
-    await db.update_balance(target_id, amount)
-    await message.answer(f"✅ Успешно начислено <b>{amount}💰</b> пользователю <code>{target_id}</code>")
-
-
-# === ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ===
-async def main():
-    logger.info("Запуск базы данных...")
-    await db.init_db()  # Инициализация всех таблиц базы данных
-
-    logger.info("Запуск фоновой рекламы...")
-    asyncio.create_task(ad_loop(bot))
-
-    logger.info("Бот успешно запущен!")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен!")
