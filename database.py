@@ -912,3 +912,134 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped!")
+kb_buttons.append([InlineKeyboardButton(text=f"Принять #{d['id']} ({d['bet']}💰)", callback_data=f"duel_join_{d['id']}")])
+
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="game_duel")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("duel_join_"))
+async def duel_join_handler(callback: CallbackQuery):
+    duel_id = int(callback.data.replace("duel_join_", ""))
+    
+    duel = active_duels.get(duel_id)
+    if not duel:
+        return await callback.answer("❌ Эта дуэль больше не существует!", show_alert=True)
+
+    if duel.get("creator_id") == callback.from_user.id:
+        return await callback.answer("❌ Нельзя принять свою же дуэль!", show_alert=True)
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < duel["bet"]:
+        return await callback.answer(f"❌ Недостаточно средств! Нужно {duel['bet']}💰", show_alert=True)
+
+    await db.update_balance(callback.from_user.id, -duel["bet"])
+
+    try:
+        res = join_duel(duel_id, callback.from_user.id)
+        winner_id = res["winner_id"]
+        loser_id = res["loser_id"]
+        win_amount = res["prize"]
+    except Exception:
+        # Резервная логика, если API в games.py работает иначе
+        win_amount = int(duel["bet"] * 2 * 0.95)
+        winner_id, loser_id = random.choice([
+            (duel["creator_id"], callback.from_user.id),
+            (callback.from_user.id, duel["creator_id"])
+        ])
+        if duel_id in active_duels:
+            del active_duels[duel_id]
+
+    await db.update_balance(winner_id, win_amount)
+    winner = await db.get_user(winner_id)
+    loser = await db.get_user(loser_id)
+
+    text = (
+        f"⚔️ <b>РЕЗУЛЬТАТ ДУЭЛИ #{duel_id}!</b>\n\n"
+        f"🪙 Монетка подброшена...\n\n"
+        f"🏆 Победитель: <b>{winner['username']}</b> (+{win_amount}💰)!\n"
+        f"💀 Проигравший: <b>{loser['username']}</b>"
+    )
+
+    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+
+    # Уведомление игроков о результате
+    for p_id, msg in [
+        (winner_id, f"🎉 Ты победил в дуэли! Выигрыш: +{win_amount}💰"),
+        (loser_id, "💀 К сожалению, ты проиграл в дуэли.")
+    ]:
+        try:
+            await bot.send_message(p_id, msg)
+        except Exception:
+            pass
+
+    await callback.answer()
+
+
+# === КЕЙСЫ И ИНВЕНТАРЬ (Опираясь на импорты из items.py) ===
+@router.callback_query(F.data == "cases")
+async def show_cases_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📦 <b>МАГАЗИН КЕЙСОВ</b>\n\n"
+        "Испытай удачу и получи крутой дроп!\n"
+        "Выбери кейс для открытия:",
+        reply_markup=cases_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("open_case_"))
+async def process_open_case(callback: CallbackQuery):
+    case_id = callback.data.replace("open_case_", "")
+    case_data = CASES.get(case_id)
+    
+    if not case_data:
+        return await callback.answer("❌ Кейс не найден!", show_alert=True)
+    
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < case_data["price"]:
+        return await callback.answer(f"❌ Недостаточно средств! Кейс стоит {case_data['price']}💰", show_alert=True)
+    
+    await db.update_balance(callback.from_user.id, -case_data["price"])
+    
+    drop = open_case(case_id)
+    await db.add_item_to_inventory(callback.from_user.id, drop["name"], drop["price"])
+    
+    rarity_color = RARITIES.get(drop["rarity"], "⬜")
+    
+    text = (
+        f"📦 <b>Ты открыл {case_data['name']}!</b>\n\n"
+        f"Тебе выпало:\n"
+        f"{rarity_color} <b>{drop['name']}</b>\n"
+        f"💰 Стоимость: <b>{drop['price']}💰</b>\n\n"
+        f"Предмет добавлен в твой инвентарь!"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎒 В инвентарь", callback_data="inventory")],
+            [InlineKeyboardButton(text="📦 Открыть ещё раз", callback_data=f"open_case_{case_id}")],
+            [InlineKeyboardButton(text="⬅️ К кейсам", callback_data="cases")]
+        ]
+    ))
+    await callback.answer()
+
+
+# === ЗАПУСК БОТА ===
+async def main():
+    logger.info("Запуск бота GBL Casino...")
+    
+    # Запускаем фоновую задачу для рекламы в беседах
+    asyncio.create_task(ad_loop(bot))
+    
+    # Пропускаем накопленные за время простоя апдейты и запускаем поллинг
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную.")
