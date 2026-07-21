@@ -12,7 +12,6 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from database import db
 from games import (
     active_bw_games, active_crash_games, active_duels, cashout_crash,
     create_bw_game, create_duel, get_waiting_bw_games, get_waiting_duels,
