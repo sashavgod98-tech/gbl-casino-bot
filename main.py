@@ -41,7 +41,7 @@ direct_duels = {}
 direct_duel_counter = 1
 
 
-# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ ===
+# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ И ОБНОЛЕНИЕ НИКОВ ===
 class AutoRegisterMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user_obj = None
@@ -55,15 +55,20 @@ class AutoRegisterMiddleware(BaseMiddleware):
                 await db.register_chat(event.message.chat.id, event.message.chat.type)
             user_obj = event.from_user
 
-        # Авторегистрация пользователя при любом взаимодействии с ботом
+        # Авторегистрация и обновление профиля при любом взаимодействии
         if user_obj and not user_obj.is_bot:
+            username = user_obj.username
+            current_display_name = (
+                f"@{username}" if username else user_obj.first_name or "Игрок"
+            )
+
             user = await db.get_user(user_obj.id)
             if not user:
-                username = user_obj.username
-                display_name = (
-                    f"@{username}" if username else user_obj.first_name or "Игрок"
-                )
-                await db.create_user(user_obj.id, display_name)
+                await db.create_user(user_obj.id, current_display_name)
+            else:
+                # Если пользователь поменял ник или имя в Telegram — обновляем БД
+                if user.get("username") != current_display_name:
+                    await db.update_user_info(user_obj.id, current_display_name)
 
         return await handler(event, data)
 
