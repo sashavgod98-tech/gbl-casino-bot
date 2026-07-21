@@ -10,8 +10,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
-from dotenv import load_dotenv
-from database import db
+from dotenv import load_dotenvФ
 from games import (
     active_bw_games, active_crash_games, active_duels, cashout_crash,
     create_bw_game, create_duel, get_waiting_bw_games, get_waiting_duels,
@@ -22,7 +21,7 @@ from keyboards import (
     bw_kb, cases_kb, crash_kb, duel_kb, inventory_kb, main_menu_kb,
     prefix_color_kb, prefix_shop_kb, tops_kb,
 )
-
+from database import db
 # Инициализация окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
