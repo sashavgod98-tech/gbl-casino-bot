@@ -41,7 +41,7 @@ direct_duels = {}
 direct_duel_counter = 1
 
 
-# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ, ТРЕКИНГ ЧАТОВ И ОБНОВЛЕНИЕ НИКОВ ===
+# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ И ОБНОВЛЕНИЕ НИКОВ ===
 class AutoRegisterMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user_obj = None
@@ -334,6 +334,74 @@ async def transfer_money_cmd(message: Message):
         f"Ты перевел <b>{amount}💰</b> игроку <b>{target_db['username']}</b>."
     )
 
+# === СИСТЕМА ПРОМОКОДОВ ===
+
+@router.message(Command("createpromo"))
+async def cmd_create_promo(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав для создания промокодов!")
+        return
+
+    parts = message.text.split()
+    
+    if len(parts) != 4:
+        await message.answer(
+            "⚠️ <b>Ошибка формата!</b>\n"
+            "Используй: <code>/createpromo [код] [награда] [лимит]</code>\n"
+            "Пример: <code>/createpromo GBL2024 5000 100</code>"
+        )
+        return
+
+    code = parts[1].upper()
+    
+    try:
+        reward = int(parts[2])
+        limit = int(parts[3])
+    except ValueError:
+        await message.answer("❌ Награда и лимит должны быть числами!")
+        return
+
+    if reward <= 0 or limit <= 0:
+        await message.answer("❌ Награда и лимит должны быть больше нуля!")
+        return
+
+    await db.add_promo_code(code, reward, limit)
+    
+    await message.answer(
+        f"✅ <b>Промокод успешно создан!</b>\n\n"
+        f"🎟 Код: <b>{code}</b>\n"
+        f"💰 Награда: <b>{reward}💰</b>\n"
+        f"👥 Лимит активаций: <b>{limit}</b>"
+    )
+
+@router.message(Command("promo"))
+async def cmd_use_promo(message: Message):
+    parts = message.text.split()
+    
+    if len(parts) < 2:
+        await message.answer(
+            "⚠️ <b>Как использовать:</b>\n"
+            "Напиши <code>/promo [твой_код]</code>\n"
+            "Пример: <code>/promo MEGA2024</code>"
+        )
+        return
+
+    code = parts[1].upper()
+    user_id = message.from_user.id
+
+    reward = await db.use_promo_code(user_id, code)
+    
+    if reward:
+        await message.answer(
+            f"🎉 <b>Успешно!</b>\n\n"
+            f"Ты активировал промокод <b>{code}</b> и получил <b>{reward}💰</b> на свой баланс!"
+        )
+    else:
+        await message.answer(
+            "❌ <b>Ошибка!</b>\n"
+            "Промокод не существует, его лимит исчерпан, либо ты уже использовал его ранее."
+        )
+
 
 # === ПРОФИЛЬ, ТОПЫ, ХЕЛП ===
 @router.message(Command("profile"))
@@ -416,6 +484,7 @@ async def help_cmd(event: CallbackQuery | Message):
         "🎁 <b>Бонус</b> — 2,500💰 каждые 24 часа\n"
         "👑 <b>Префиксы</b> — выделись в общем рейтинге!\n"
         "💸 <b>Перевод денег</b> — ответь командой <code>передать 100</code> на сообщение игрока\n"
+        "🎟 <b>Промокоды</b> — используй команду <code>/promo [код]</code> для получения бонусов!\n"
     )
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(text, reply_markup=main_menu_kb())
@@ -858,7 +927,7 @@ async def duel_list(callback: CallbackQuery):
         await callback.answer()
         return
 
-    text = "📋 <b>Активные дуэлей:</b>\n\n"
+    text = "📋 <b>Активные дуэли:</b>\n\n"
     kb_buttons = []
 
     if isinstance(duels, dict):
@@ -905,60 +974,49 @@ async def duel_join_handler(callback: CallbackQuery):
 
     user = await db.get_user(callback.from_user.id)
     if not user or user["balance"] < duel["bet"]:
-        await callback.answer(f"❌ Нужно {duel['bet']}💰", show_alert=True)
+        await callback.answer(f"❌ Нужно {duel['bet']}💰 для участия!", show_alert=True)
         return
 
-    # Списание ставки
+    # Списываем баланс и подключаем к дуэли
     await db.update_balance(callback.from_user.id, -duel["bet"])
-
+    
     try:
-        # Проведение дуэли через games.py
-        res = resolve_duel(duel_id, callback.from_user.id)
+        res = join_duel(duel_id, callback.from_user.id)
         
-        # Начисляем победителю
+        # Начисляем выигрыш
         await db.update_balance(res["winner_id"], res["prize"])
         
         winner = await db.get_user(res["winner_id"])
         loser = await db.get_user(res["loser_id"])
-
-        text = (
+        
+        await callback.message.edit_text(
             f"⚔️ <b>ДУЭЛЬ СОСТОЯЛАСЬ!</b>\n\n"
             f"🏆 Победитель: <b>{winner['username']}</b> (+{res['prize']}💰)!\n"
-            f"💀 Повержен: <b>{loser['username']}</b>"
+            f"💀 Повержен: <b>{loser['username']}</b>",
+            reply_markup=main_menu_kb()
         )
-        
-        await callback.message.edit_text(text, reply_markup=main_menu_kb())
-        
-        # Пытаемся уведомить игроков в ЛС (если бот может им писать)
-        try:
-            if res["winner_id"] == callback.from_user.id:
-                await bot.send_message(res["loser_id"], f"💀 Игрок {winner['username']} принял твою дуэль и победил.")
-            else:
-                await bot.send_message(res["loser_id"], f"💀 Ты проиграл дуэль против {winner['username']}.")
-                await bot.send_message(res["winner_id"], f"🎉 Ты победил в дуэли! Твой выигрыш: +{res['prize']}💰")
-        except Exception as e:
-            pass
-            
     except Exception as e:
-        logger.error(f"Error resolving duel: {e}")
-        await callback.message.edit_text("❌ Произошла ошибка при завершении дуэли.", reply_markup=main_menu_kb())
-
+        logger.error(f"Ошибка в дуэли: {e}")
+        await callback.answer("❌ Произошла ошибка при проведении дуэли.", show_alert=True)
+        
     await callback.answer()
 
 
-# === ЗАПУСК БОТА ===
+# === ЗАПУСК БОТА И БАЗЫ ДАННЫХ ===
 async def main():
-    logger.info("Бот запускается...")
+    logger.info("Initializing database...")
+    await db.init_db()
     
-    # Запуск фоновой задачи рассылки (рекламы)
+    logger.info("Starting bot...")
+    
+    # Запускаем цикл с авторекламой в фоне, если нужно
     asyncio.create_task(ad_loop(bot))
     
-    # Сбрасываем webhook (если был установлен) и запускаем polling
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Запускаем самого бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен вручную.")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped!")
