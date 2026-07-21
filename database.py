@@ -141,6 +141,15 @@ class Database:
             )
             await db.commit()
 
+    async def update_user_info(self, tg_id: int, username: str):
+        """Обновляет никнейм/отображаемое имя пользователя в БД"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE users SET username = ? WHERE tg_id = ?",
+                (username, tg_id),
+            )
+            await db.commit()
+
     async def update_balance(self, tg_id: int, amount: int):
         async with aiosqlite.connect(self.db_path) as db:
             if amount > 0:
