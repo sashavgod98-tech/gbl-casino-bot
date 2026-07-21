@@ -41,7 +41,7 @@ direct_duels = {}
 direct_duel_counter = 1
 
 
-# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ И ОБНОЛЕНИЕ НИКОВ ===
+# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ И ОБНОВЛЕНИЕ НИКОВ ===
 class AutoRegisterMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user_obj = None
@@ -280,6 +280,58 @@ async def decline_direct_duel(callback: CallbackQuery):
     await callback.answer("Дуэль отменена.")
 
 
+# === ПЕРЕВОД ДЕНЕГ ИГРОКУ ===
+@router.message(F.text.lower().startswith("передать") | F.text.lower().startswith("pay") | F.text.lower().startswith("give"))
+async def transfer_money_cmd(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.answer(
+            "⚠️ <b>Как передать деньги:</b>\n"
+            "Ответь (reply) на сообщение игрока текстом:\n"
+            "<code>передать 100</code>"
+        )
+        return
+
+    target_user = message.reply_to_message.from_user
+    if target_user.id == message.from_user.id:
+        await message.answer("❌ Нельзя переводить деньги самому себе!")
+        return
+
+    if target_user.is_bot:
+        await message.answer("❌ Нельзя переводить деньги ботам!")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("⚠️ Укажи корректную сумму для перевода! Пример: <code>передать 500</code>")
+        return
+
+    amount = int(parts[1])
+    if amount <= 0:
+        await message.answer("❌ Сумма перевода должна быть больше 0💰!")
+        return
+
+    sender_db = await db.get_user(message.from_user.id)
+    if not sender_db or sender_db["balance"] < amount:
+        await message.answer(f"❌ У тебя недостаточно средств! Твой баланс: <b>{sender_db['balance'] if sender_db else 0}💰</b>")
+        return
+
+    target_db = await db.get_user(target_user.id)
+    if not target_db:
+        t_username = target_user.username
+        t_display = f"@{t_username}" if t_username else target_user.first_name or "Игрок"
+        await db.create_user(target_user.id, t_display)
+        target_db = await db.get_user(target_user.id)
+
+    # Перевод средств
+    await db.update_balance(message.from_user.id, -amount)
+    await db.update_balance(target_user.id, amount)
+
+    await message.answer(
+        f"✅ <b>Успешный перевод!</b>\n\n"
+        f"Ты перевел <b>{amount}💰</b> игроку <b>{target_db['username']}</b>."
+    )
+
+
 # === ПРОФИЛЬ, ТОПЫ, ХЕЛП ===
 @router.message(Command("profile"))
 @router.callback_query(F.data == "profile")
@@ -301,9 +353,9 @@ async def show_profile(callback: CallbackQuery | Message):
         f"🏷️ Префикс + Ник: <b>{pref}{user['username']}</b>\n"
         f"💰 Баланс: <b>{user['balance']}💰</b>\n"
         f"🏆 Топ: <b>#{user_rank or '—'}</b>\n"
-        f"🎒 Инвентарь: <b>{user['inventory_value']}💰</b>\n"
-        f"📈 Выиграно: <b>{user['total_won']}💰</b>\n"
-        f"📉 Потрачено: <b>{user['total_spent']}💰</b>\n\n"
+        f"🎒 Инвентарь: <b>{user.get('inventory_value', 0)}💰</b>\n"
+        f"📈 Выиграно: <b>{user.get('total_won', 0)}💰</b>\n"
+        f"📉 Потрачено: <b>{user.get('total_spent', 0)}💰</b>\n\n"
         f"🔗 <b>Реферальная ссылка:</b>\n<code>{ref_link}</code>"
     )
 
@@ -675,15 +727,17 @@ async def bw_join_handler(callback: CallbackQuery):
         winner = await db.get_user(res["winner_id"])
         loser = await db.get_user(res["loser_id"])
 
-        text = (
-            f"🏁 <b>ИТОГИ ИГРЫ «БЕЛОЕ ИЛИ ЧЁРНОЕ»</b>\n\n"
-            f"Загаданный цвет: <b>{res['secret_choice']}</b>\n"
-            f"Выбор соперника: <b>{res['guess_choice']}</b>\n\n"
-            f"🏆 Победитель: <b>{winner['username']}</b> (+{res['prize']}💰)\n"
-            f"💀 Проигравший: {loser['username']}\n"
-            f"🏦 Комиссия: {res.get('commission', 0)}💰"
-        )
         winner_id, loser_id, win_amount = res["winner_id"], res["loser_id"], res["prize"]
+        color_str = "⚪ БЕЛОЕ" if res.get('secret_choice') == "white" else "⚫ ЧЁРНОЕ"
+        guesser_str = "⚪ БЕЛОЕ" if res.get('guess_choice') == "white" else "⚫ ЧЁРНОЕ"
+
+        text = (
+            f"🎲 <b>РЕЗУЛЬТАТ ИГРЫ Б/Ч #{game_id}!</b>\n\n"
+            f"Загаданный цвет: <b>{color_str}</b>\n"
+            f"Выбор соперника: <b>{guesser_str}</b>\n\n"
+            f"🏆 Победитель: <b>{winner['username']}</b> (+{win_amount}💰)!\n"
+            f"💔 Проигравший: <b>{loser['username']}</b>"
+        )
     except Exception:
         guesser_choice = guess
         win_amount = int(game["bet"] * 2 * 0.95)
@@ -905,201 +959,89 @@ async def open_case_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data == "inventory")
 async def show_inventory(callback: CallbackQuery):
-    items = await db.get_inventory(callback.from_user.id)
+    user_id = callback.from_user.id
+    items = await db.get_inventory(user_id)
+    user = await db.get_user(user_id)
+
     if not items:
         await callback.message.edit_text(
-            "🎒 <b>Инвентарь пуст!</b>", reply_markup=main_menu_kb()
+            "🎒 <b>Твой инвентарь пуст!</b>\nОткрывай кейсы в меню игр.",
+            reply_markup=main_menu_kb()
         )
         await callback.answer()
         return
 
-    text = f"🎒 <b>Твой инвентарь ({len(items)} предметов):</b>\n\n"
-    total = 0
+    text = f"🎒 <b>Инвентарь игрока {user['username']}:</b>\n\n"
+    kb = []
+    
     for item in items[:10]:
-        rarity = RARITIES.get(item.get("item_rarity"), {})
-        emoji = rarity.get("emoji", "⚪")
-        text += f"{emoji} {item['item_name']} — <b>{item['item_price']}💰</b>\n"
-        total += item["item_price"]
+        item_id = item["id"]
+        name = item["name"]
+        price = item["price"]
+        rarity = item["rarity"]
+        text += f"• {name} ({rarity}) — <b>{price}💰</b>\n"
+        kb.append([InlineKeyboardButton(text=f"Продать: {name} ({price}💰)", callback_data=f"sell_item_{item_id}")])
 
-    text += f"\n💼 <b>Общая ценность: {total}💰</b>"
-    await callback.message.edit_text(text, reply_markup=inventory_kb(items))
+    kb.append([InlineKeyboardButton(text="💸 Продать все", callback_data="sell_all_items")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("sell_item_"))
 async def sell_item_handler(callback: CallbackQuery):
     item_id = int(callback.data.replace("sell_item_", ""))
-    price = await db.sell_item(item_id, callback.from_user.id)
-    if price and price > 0:
-        await callback.answer(f"✅ Продано за +{price}💰!", show_alert=True)
+    sold = await db.sell_item(callback.from_user.id, item_id)
+    if sold:
+        await callback.answer(f"✅ Предмет успешно продан за {sold['price']}💰!", show_alert=True)
     else:
         await callback.answer("❌ Предмет не найден!", show_alert=True)
     await show_inventory(callback)
 
 
 @router.callback_query(F.data == "sell_all_items")
-async def sell_all_handler(callback: CallbackQuery):
-    total = await db.sell_all_items(callback.from_user.id)
-    if total and total > 0:
-        await callback.answer(
-            f"💥 Все предметы проданы на сумму +{total}💰!", show_alert=True
-        )
+async def sell_all_items_handler(callback: CallbackQuery):
+    earned = await db.sell_all_items(callback.from_user.id)
+    if earned > 0:
+        await callback.answer(f"✅ Все предметы проданы на сумму {earned}💰!", show_alert=True)
     else:
-        await callback.answer("❌ Инвентарь уже пуст!", show_alert=True)
+        await callback.answer("❌ В инвентаре нет предметов для продажи!", show_alert=True)
     await show_inventory(callback)
 
 
-# === ТОПЫ ===
-@router.callback_query(F.data == "tops")
-async def show_tops(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🏆 <b>Рейтинги сервера</b>", reply_markup=tops_kb()
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "top_balance")
-async def top_balance_handler(callback: CallbackQuery):
-    players = await db.get_top_balance(10)
-    text = "💰 <b>ТОП 10 БОГАЧЕЙ:</b>\n\n"
-
-    for i, p in enumerate(players, 1):
-        medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"<b>{i}.</b>"
-        pref = f"{p['prefix']} " if p.get("prefix") else ""
-        text += f"{medal} {pref}{p['username']} — <b>{p['balance']}💰</b>\n"
-
-    await callback.message.edit_text(text, reply_markup=tops_kb())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "top_inventory")
-async def top_inventory_handler(callback: CallbackQuery):
-    players = await db.get_top_inventory(10)
-    text = "🎒 <b>ТОП 10 КОЛЛЕКЦИОНЕРОВ:</b>\n\n"
-
-    for i, p in enumerate(players, 1):
-        medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"<b>{i}.</b>"
-        pref = f"{p['prefix']} " if p.get("prefix") else ""
-        text += (
-            f"{medal} {pref}{p['username']} — <b>{p['inventory_value']}💰</b>\n"
-        )
-
-    await callback.message.edit_text(text, reply_markup=tops_kb())
-    await callback.answer()
-
-
-# === АДМИНКА, РАССЫЛКА И ПРОМОКОДЫ ===
-@router.message(Command("givemoney"))
-async def admin_give_money(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ <b>Ошибка доступа!</b> У вас нет прав админа.")
-        return
-
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("⚠️ Формат: <code>/givemoney TG_ID СУММА</code>")
-        return
-
-    target_id = int(args[1])
-    amount = int(args[2])
-
-    await db.update_balance(target_id, amount)
-    await message.answer(f"✅ Успешно выдано <b>{amount}💰</b> игроку {target_id}")
-
-
-@router.message(Command("setprefix"))
-async def admin_set_prefix(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ <b>Ошибка доступа!</b> У вас нет прав админа.")
-        return
-
-    args = message.text.split(maxsplit=2)
-    if len(args) != 3:
-        await message.answer("⚠️ Формат: <code>/setprefix TG_ID ПРЕФИКС</code>")
-        return
-
-    target_id = int(args[1])
-    prefix = args[2]
-
-    await db.set_prefix(target_id, prefix)
-    await message.answer(f"✅ Игроку {target_id} установлен префикс {prefix}")
-
-
-@router.message(Command("sendall"))
-async def admin_broadcast(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    text = message.text.replace("/sendall", "").strip()
-    if not text:
-        await message.answer("⚠️ Напиши текст рассылки: <code>/sendall Всем привет!</code>")
-        return
-
-    chats = await db.get_all_chats()
-    count = 0
-    await message.answer("⏳ Начинаю рассылку...")
-    for chat in chats:
-        try:
-            await bot.send_message(chat['chat_id'], f"📢 <b>Сообщение от Администрации:</b>\n\n{text}")
-            count += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-    await message.answer(f"✅ Доставлено в {count} чатов/сообщений.")
-
-
-@router.message(Command("createpromo"))
-async def admin_create_promo(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ <b>Ошибка доступа!</b> У вас нет прав админа.")
-        return
-
-    args = message.text.split()
-    if len(args) != 4:
-        await message.answer("⚠️ Формат: <code>/createpromo КОД НАГРАДА ИСПОЛЬЗОВАНИЙ</code>")
-        return
-
-    code = args[1].upper()
-    reward = int(args[2])
-    limit = int(args[3])
-
-    await db.add_promo_code(code, reward, limit)
-    await message.answer(f"✅ Промокод <b>{code}</b> создан! Рассылаю уведомление во все чаты...")
-
-    chats = await db.get_all_chats()
-    for chat in chats:
-        try:
-            await bot.send_message(
-                chat['chat_id'], 
-                f"🎁 <b>СОЗДАН НОВЫЙ ПРОМОКОД!</b>\n\n"
-                f"Код: <code>{code}</code>\n"
-                f"Награда: <b>{reward}💰</b>\n"
-                f"Активаций: <b>{limit}</b>\n\n"
-                f"Быстрее пиши команду: <code>/promo {code}</code>"
-            )
-        except Exception:
-            pass
-
-
-@router.message(Command("promo"))
-async def use_promo_cmd(message: Message):
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("⚠️ Введи промокод: <code>/promo КОД</code>")
-        return
-
-    code = args[1].upper()
-    res = await db.use_promo_code(message.from_user.id, code)
-
-    if res.get("success"):
-        await message.answer(f"🎉 <b>Промокод активирован!</b>\nТебе начислено <b>+{res['reward']}💰</b>!")
+# === ТОПЫ ИГРОКОВ ===
+@router.callback_query(F.data.startswith("top_"))
+async def show_top_callback(callback: CallbackQuery):
+    top_type = callback.data.replace("top_", "")
+    
+    if top_type == "balance":
+        top_list = await db.get_top_by_balance()
+        title = "💰 <b>Топ по балансу</b>"
+    elif top_type == "wins":
+        top_list = await db.get_top_by_wins() if hasattr(db, "get_top_by_wins") else []
+        title = "🏆 <b>Топ по победам</b>"
     else:
-        await message.answer(f"❌ {res.get('error', 'Ошибка активации промокода!')}")
+        top_list = await db.get_top_by_balance()
+        title = "🏆 <b>Рейтинг игроков</b>"
+
+    text = f"{title}\n\n"
+    for i, user in enumerate(top_list[:10], 1):
+        pref = f"{user['prefix']} " if user.get('prefix') else ""
+        val = user.get('balance', user.get('score', 0))
+        text += f"{i}. {pref}<b>{user['username']}</b> — {val}💰\n"
+
+    await callback.message.edit_text(text, reply_markup=tops_kb())
+    await callback.answer()
 
 
 # === ЗАПУСК БОТА ===
 async def main():
+    # Запуск фонового процесса рассылки рекламы
     asyncio.create_task(ad_loop(bot))
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Starting bot polling...")
     await dp.start_polling(bot)
 
 
