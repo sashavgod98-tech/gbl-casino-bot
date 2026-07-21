@@ -36,27 +36,45 @@ bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
+# Хранилище прямых дуэлей (по вызову)
+direct_duels = {}
+direct_duel_counter = 1
 
-# === МИДЛВАРЬ: РЕГИСТРАЦИЯ ВСЕХ ЧАТОВ И ПОЛЬЗОВАТЕЛЕЙ ДЛЯ РАССЫЛКИ ===
-class ChatTrackerMiddleware(BaseMiddleware):
+
+# === МИДЛВАРЬ: АВТОРЕГИСТРАЦИЯ И ТРЕКИНГ ЧАТОВ ===
+class AutoRegisterMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if isinstance(event, Message) and event.chat:
-            await db.register_chat(event.chat.id, event.chat.type)
-        elif isinstance(event, CallbackQuery) and event.message and event.message.chat:
-            await db.register_chat(event.message.chat.id, event.message.chat.type)
+        user_obj = None
+
+        if isinstance(event, Message):
+            if event.chat:
+                await db.register_chat(event.chat.id, event.chat.type)
+            user_obj = event.from_user
+        elif isinstance(event, CallbackQuery):
+            if event.message and event.message.chat:
+                await db.register_chat(event.message.chat.id, event.message.chat.type)
+            user_obj = event.from_user
+
+        # Авторегистрация пользователя при любом взаимодействии с ботом
+        if user_obj and not user_obj.is_bot:
+            user = await db.get_user(user_obj.id)
+            if not user:
+                username = user_obj.username
+                display_name = (
+                    f"@{username}" if username else user_obj.first_name or "Игрок"
+                )
+                await db.create_user(user_obj.id, display_name)
+
         return await handler(event, data)
 
 
-router.message.middleware(ChatTrackerMiddleware())
-router.callback_query.middleware(ChatTrackerMiddleware())
+router.message.middleware(AutoRegisterMiddleware())
+router.callback_query.middleware(AutoRegisterMiddleware())
 dp.include_router(router)
 
 
 class Form(StatesGroup):
     waiting_custom_crash = State()
-
-
-print("🚀 Запуск обновленного GBL Casino Bot...")
 
 
 # === АВТОМАТИЧЕСКАЯ РЕКЛАМА В БЕСЕДАХ (РАЗ В ЧАС) ===
@@ -88,19 +106,10 @@ async def ad_loop(bot_instance: Bot):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
 
-    username = message.from_user.username
-    display_name = (
-        f"@{username}" if username else message.from_user.first_name or "Игрок"
-    )
-
     user = await db.get_user(message.from_user.id)
-    if not user:
-        await db.create_user(message.from_user.id, display_name)
-        user = await db.get_user(message.from_user.id)
-
     ref_link = await db.get_referral_link(message.from_user.id)
     user_rank = await db.get_user_rank(message.from_user.id)
-    pref = f"{user['prefix']} " if user['prefix'] else ""
+    pref = f"{user['prefix']} " if user and user['prefix'] else ""
 
     text = (
         f"🎮 <b>Добро пожаловать в GBL Casino!</b>\n\n"
@@ -114,6 +123,158 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=main_menu_kb())
 
 
+# === ПЕРСОНАЛЬНЫЕ ДУЭЛИ В ЧАТЕ (ОТВЕТОМ НА СООБЩЕНИЕ) ===
+@router.message(F.text.lower().startswith("дуэль") | F.text.lower().startswith("дуель") | Command("duel"))
+async def create_direct_duel(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.answer(
+            "⚠️ <b>Как бросить вызов:</b>\n"
+            "Ответь (reply) на сообщение игрока текстом:\n"
+            "<code>дуэль 100</code>"
+        )
+        return
+
+    target_user = message.reply_to_message.from_user
+
+    if target_user.id == message.from_user.id:
+        await message.answer("❌ Нельзя вызвать на дуэль самого себя!")
+        return
+
+    if target_user.is_bot:
+        await message.answer("❌ Нельзя вызывать ботов!")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("⚠️ Укажи корректную сумму дуэли! Пример: <code>дуэль 500</code>")
+        return
+
+    bet = int(parts[1])
+    if bet <= 0:
+        await message.answer("❌ Ставка должна быть больше 0💰!")
+        return
+
+    challenger_db = await db.get_user(message.from_user.id)
+    if not challenger_db or challenger_db["balance"] < bet:
+        await message.answer(f"❌ У тебя недостаточно средств! Твой баланс: <b>{challenger_db['balance'] if challenger_db else 0}💰</b>")
+        return
+
+    target_db = await db.get_user(target_user.id)
+    if not target_db:
+        t_username = target_user.username
+        t_display = f"@{t_username}" if t_username else target_user.first_name or "Игрок"
+        await db.create_user(target_user.id, t_display)
+        target_db = await db.get_user(target_user.id)
+
+    if target_db["balance"] < bet:
+        await message.answer(f"❌ У игрока <b>{target_db['username']}</b> недостаточно средств ({target_db['balance']}💰)!")
+        return
+
+    global direct_duel_counter
+    duel_id = direct_duel_counter
+    direct_duel_counter += 1
+
+    c_name = challenger_db["username"]
+    t_name = target_db["username"]
+
+    direct_duels[duel_id] = {
+        "challenger_id": message.from_user.id,
+        "challenger_name": c_name,
+        "target_id": target_user.id,
+        "target_name": t_name,
+        "bet": bet,
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⚔️ Принять", callback_data=f"dduel_accept_{duel_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"dduel_decline_{duel_id}")
+        ]
+    ])
+
+    target_mention = f"@{target_user.username}" if target_user.username else f"<b>{t_name}</b>"
+
+    await message.answer(
+        f"⚔️ <b>ВЫЗОВ НА ДУЭЛЬ!</b>\n\n"
+        f"Игрок <b>{c_name}</b> вызывает на дуэль {target_mention}!\n"
+        f"💰 Ставка: <b>{bet}💰</b>\n\n"
+        f"Ждем ответа соперника...",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("dduel_accept_"))
+async def accept_direct_duel(callback: CallbackQuery):
+    duel_id = int(callback.data.replace("dduel_accept_", ""))
+    duel = direct_duels.get(duel_id)
+
+    if not duel:
+        await callback.answer("❌ Эта дуэль больше недействительна!", show_alert=True)
+        return
+
+    if callback.from_user.id != duel["target_id"]:
+        await callback.answer("❌ Этот вызов адресован не тебе!", show_alert=True)
+        return
+
+    challenger = await db.get_user(duel["challenger_id"])
+    target = await db.get_user(duel["target_id"])
+
+    if not challenger or challenger["balance"] < duel["bet"]:
+        await callback.answer("❌ У зачинщика дуэли не хватает средств!", show_alert=True)
+        del direct_duels[duel_id]
+        return
+
+    if not target or target["balance"] < duel["bet"]:
+        await callback.answer("❌ У тебя недостаточно средств для принятия дуэли!", show_alert=True)
+        return
+
+    # Списание ставок
+    await db.update_balance(duel["challenger_id"], -duel["bet"])
+    await db.update_balance(duel["target_id"], -duel["bet"])
+
+    # Определение победителя 50/50
+    winner_id, loser_id = (
+        (duel["challenger_id"], duel["target_id"]) 
+        if random.choice([True, False]) 
+        else (duel["target_id"], duel["challenger_id"])
+    )
+
+    prize = int(duel["bet"] * 2 * 0.95)  # Выигрыш за вычетом 5% комиссии
+    await db.update_balance(winner_id, prize)
+
+    winner = await db.get_user(winner_id)
+    loser = await db.get_user(loser_id)
+
+    del direct_duels[duel_id]
+
+    await callback.message.edit_text(
+        f"⚔️ <b>ДУЭЛЬ СОСТОЯЛАСЬ!</b>\n\n"
+        f"🪙 Монетка подброшена...\n\n"
+        f"🏆 Победитель: <b>{winner['username']}</b> (+{prize}💰)!\n"
+        f"💀 Повержен: <b>{loser['username']}</b>"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dduel_decline_"))
+async def decline_direct_duel(callback: CallbackQuery):
+    duel_id = int(callback.data.replace("dduel_decline_", ""))
+    duel = direct_duels.get(duel_id)
+
+    if not duel:
+        await callback.answer("❌ Дуэль не найдена!", show_alert=True)
+        return
+
+    if callback.from_user.id != duel["target_id"] and callback.from_user.id != duel["challenger_id"]:
+        await callback.answer("❌ Ты не являешься участником этой дуэли!", show_alert=True)
+        return
+
+    del direct_duels[duel_id]
+
+    await callback.message.edit_text("❌ <b>Дуэль отклонена.</b>")
+    await callback.answer("Дуэль отменена.")
+
+
 # === ПРОФИЛЬ, ТОПЫ, ХЕЛП ===
 @router.message(Command("profile"))
 @router.callback_query(F.data == "profile")
@@ -123,7 +284,7 @@ async def show_profile(callback: CallbackQuery | Message):
 
     user = await db.get_user(user_id)
     if not user:
-        await msg.answer("❌ Сначала начни игру /start")
+        await msg.answer("❌ Ошибка получения профиля.")
         return
 
     ref_link = await db.get_referral_link(user_id)
@@ -160,7 +321,7 @@ async def help_cmd(event: CallbackQuery | Message):
         "ℹ️ <b>ПОМОЩЬ И ИГРЫ</b>\n\n"
         "📈 <b>Краш</b> — растущий множитель с кастомными ставками!\n"
         "⚪/⚫ <b>Белое и Чёрное</b> — PvP угадайка с другими игроками\n"
-        "⚔️ <b>Дуэль</b> — классическая монетка на двоих\n"
+        "⚔️ <b>Дуэль</b> — создай дуэль в меню или напиши <code>дуэль [сумма]</code> в ответ на сообщение человека!\n"
         "📦 <b>Кейсы</b> — открывай и продавай лут\n"
         "🎁 <b>Бонус</b> — 2,500💰 каждые 24 часа\n"
         "👑 <b>Префиксы</b> — выделись в общем рейтинге!\n"
@@ -404,7 +565,7 @@ async def show_bw_menu(callback: CallbackQuery):
 async def bw_create_game_handler(callback: CallbackQuery):
     parts = callback.data.split("_")
     bet = int(parts[2])
-    choice = parts[3]  # 'white' or 'black'
+    choice = parts[3]
 
     user = await db.get_user(callback.from_user.id)
     if not user or user["balance"] < bet:
@@ -412,7 +573,7 @@ async def bw_create_game_handler(callback: CallbackQuery):
         return
 
     await db.update_balance(callback.from_user.id, -bet)
-    
+
     try:
         game_id = create_bw_game(callback.from_user.id, user["username"], bet, choice)
     except Exception:
@@ -559,11 +720,13 @@ async def bw_join_handler(callback: CallbackQuery):
     await callback.answer()
 
 
-# === ДУЭЛИ ===
+# === ДУЭЛИ (ОБЩИЕ) ===
 @router.callback_query(F.data == "game_duel")
 async def show_duel(callback: CallbackQuery):
     await callback.message.edit_text(
-        "⚔️ <b>PvP Дуэли (Монетка)</b>\nВыбери ставку:", reply_markup=duel_kb()
+        "⚔️ <b>PvP Дуэли (Монетка)</b>\n\n"
+        "Создай общую дуэль для всех или ответь человеку на сообщение: <code>дуэль 100</code>", 
+        reply_markup=duel_kb()
     )
     await callback.answer()
 
@@ -578,7 +741,7 @@ async def duel_create(callback: CallbackQuery):
         return
 
     await db.update_balance(callback.from_user.id, -bet)
-    
+
     try:
         duel_id = create_duel(callback.from_user.id, user["username"], bet)
     except Exception:
@@ -781,7 +944,7 @@ async def sell_all_handler(callback: CallbackQuery):
     await show_inventory(callback)
 
 
-# === ТОПЫ С ЮЗЕРНЕЙМАМИ И ПРЕФИКСАМИ ===
+# === ТОПЫ ===
 @router.callback_query(F.data == "tops")
 async def show_tops(callback: CallbackQuery):
     await callback.message.edit_text(
@@ -859,7 +1022,8 @@ async def admin_set_prefix(message: Message):
 
 @router.message(Command("sendall"))
 async def admin_broadcast(message: Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id != ADMIN_ID:
+        return
 
     text = message.text.replace("/sendall", "").strip()
     if not text:
@@ -887,9 +1051,7 @@ async def admin_create_promo(message: Message):
 
     args = message.text.split()
     if len(args) != 4:
-        await message.answer(
-            "⚠️ Формат: <code>/createpromo КОД НАГРАДА ИСПОЛЬЗОВАНИЙ</code>"
-        )
+        await message.answer("⚠️ Формат: <code>/createpromo КОД НАГРАДА ИСПОЛЬЗОВАНИЙ</code>")
         return
 
     code = args[1].upper()
@@ -897,7 +1059,7 @@ async def admin_create_promo(message: Message):
     limit = int(args[3])
 
     await db.add_promo_code(code, reward, limit)
-    await message.answer(f"✅ Промокод {code} создан! Рассылаю уведомление во все чаты...")
+    await message.answer(f"✅ Промокод <b>{code}</b> создан! Рассылаю уведомление во все чаты...")
 
     chats = await db.get_all_chats()
     for chat in chats:
@@ -915,85 +1077,23 @@ async def admin_create_promo(message: Message):
 
 
 @router.message(Command("promo"))
-async def activate_promo(message: Message):
+async def use_promo_cmd(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("⚠️ Введи: <code>/promo КОД</code>")
+        await message.answer("⚠️ Введи промокод: <code>/promo КОД</code>")
         return
 
-    res = await db.use_promo_code(message.from_user.id, args[1])
-    if res:
-        await message.answer(f"🎉 Промокод активирован! Получено: +{res}💰")
+    code = args[1].upper()
+    res = await db.use_promo_code(message.from_user.id, code)
+
+    if res.get("success"):
+        await message.answer(f"🎉 <b>Промокод активирован!</b>\nТебе начислено <b>+{res['reward']}💰</b>!")
     else:
-        await message.answer("❌ Промокод не существует или закончились активации!")
+        await message.answer(f"❌ {res.get('error', 'Ошибка активации промокода!')}")
 
 
-@router.callback_query(F.data == "promo")
-@router.callback_query(F.data == "promo_info")
-async def promo_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🎟️ Для активации промокода напиши:\n<code>/promo ВАШ_КОД</code>",
-        reply_markup=main_menu_kb(),
-    )
-    await callback.answer()
-
-
-# === ПЕРЕДАЧА ДЕНЕГ МЕЖДУ ИГРОКАМИ (С АВТО-РЕГИСТРАЦИЕЙ) ===
-@router.message(Command("pay"))
-@router.message(
-    F.reply_to_message
-    & F.text.lower().startswith(("передать", "pay", "дать", "перевод"))
-)
-async def transfer_money(message: Message):
-    if not message.reply_to_message:
-        await message.answer("⚠️ Ответь на сообщение игрока с командой <code>передать 100</code>!")
-        return
-
-    sender_id = message.from_user.id
-    target = message.reply_to_message.from_user
-
-    if target.is_bot or target.id == sender_id:
-        await message.answer("❌ Нельзя переводить деньги ботам или самому себе!")
-        return
-
-    words = message.text.split()
-    amount = next((int(w) for w in words if w.isdigit()), None)
-
-    if not amount or amount <= 0:
-        await message.answer("⚠️ Укажи корректную сумму числом!")
-        return
-
-    sender = await db.get_user(sender_id)
-    if not sender:
-        display_name = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "Игрок")
-        await db.create_user(sender_id, display_name)
-        sender = await db.get_user(sender_id)
-
-    if sender["balance"] < amount:
-        await message.answer(f"❌ Недостаточно денег на балансе ({sender['balance']}💰)!")
-        return
-
-    recipient = await db.get_user(target.id)
-    if not recipient:
-        display_name = f"@{target.username}" if target.username else (target.first_name or "Игрок")
-        await db.create_user(target.id, display_name)
-
-    await db.update_balance(sender_id, -amount)
-    await db.update_balance(target.id, amount)
-
-    sender_name = message.from_user.full_name
-    target_name = target.full_name
-
-    await message.answer(
-        f"💸 <b>Перевод выполнен!</b>\n\n"
-        f"От: <b>{sender_name}</b>\n"
-        f"Кому: <b>{target_name}</b>\n"
-        f"Сумма: <b>{amount}💰</b>"
-    )
-
-
+# === ЗАПУСК БОТА ===
 async def main():
-    await db.init_db()
     asyncio.create_task(ad_loop(bot))
     await dp.start_polling(bot)
 
