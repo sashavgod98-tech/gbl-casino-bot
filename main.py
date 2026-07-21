@@ -114,7 +114,7 @@ async def cmd_start(message: Message, state: FSMContext):
     user = await db.get_user(message.from_user.id)
     ref_link = await db.get_referral_link(message.from_user.id)
     user_rank = await db.get_user_rank(message.from_user.id)
-    pref = f"{user['prefix']} " if user and user['prefix'] else ""
+    pref = f"{user['prefix']} " if user and user.get('prefix') else ""
 
     text = (
         f"🎮 <b>Добро пожаловать в GBL Casino!</b>\n\n"
@@ -346,7 +346,7 @@ async def show_profile(callback: CallbackQuery | Message):
 
     ref_link = await db.get_referral_link(user_id)
     user_rank = await db.get_user_rank(user_id)
-    pref = f"{user['prefix']} " if user['prefix'] else ""
+    pref = f"{user['prefix']} " if user.get('prefix') else ""
 
     text = (
         f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n\n"
@@ -367,8 +367,38 @@ async def show_profile(callback: CallbackQuery | Message):
 
 
 @router.message(Command("top"))
-async def text_cmd_top(message: Message):
-    await message.answer("🏆 <b>Рейтинги сервера</b>", reply_markup=tops_kb())
+@router.callback_query(F.data == "tops")
+async def text_cmd_top(event: CallbackQuery | Message):
+    text = "🏆 <b>Рейтинги сервера GBL Casino</b>\nВыбери нужную категорию ниже:"
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=tops_kb())
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=tops_kb())
+
+
+@router.callback_query(F.data.startswith("top_"))
+async def show_specific_top(callback: CallbackQuery):
+    top_type = callback.data.replace("top_", "")
+    top_users = await db.get_top_users(top_type, limit=10)
+
+    title_map = {
+        "balance": "💰 ТОП ПО БАЛАНСУ",
+        "won": "📈 ТОП ПО ВЫИГРЫШАМ",
+        "spent": "📉 ТОП ПО ПОТРАЧЕННОМУ"
+    }
+
+    text = f"<b>{title_map.get(top_type, '🏆 ТОП ИГРОКОВ')}</b>\n\n"
+    if not top_users:
+        text += "Список пока пуст..."
+    else:
+        for idx, u in enumerate(top_users, start=1):
+            pref = f"{u['prefix']} " if u.get('prefix') else ""
+            val = u.get(top_type, u.get('balance', 0))
+            text += f"{idx}. <b>{pref}{u['username']}</b> — {val}💰\n"
+
+    await callback.message.edit_text(text, reply_markup=tops_kb())
+    await callback.answer()
 
 
 @router.message(Command("help"))
@@ -404,7 +434,7 @@ async def back_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "prefix_shop")
 async def show_prefix_shop(callback: CallbackQuery):
     user = await db.get_user(callback.from_user.id)
-    curr_prefix = user["prefix"] if user and user["prefix"] else "Отсутствует"
+    curr_prefix = user["prefix"] if user and user.get("prefix") else "Отсутствует"
 
     text = (
         f"👑 <b>МАГАЗИН ПРЕФИКСОВ</b>\n\n"
@@ -899,151 +929,122 @@ async def duel_join_handler(callback: CallbackQuery):
         loser = await db.get_user(res["loser_id"])
         await callback.message.edit_text(
             f"🏆 <b>Итоги Дуэли #{duel_id}</b>\n\n"
-            f"Монета: <b>{res.get('result', 'Победа').upper()}</b>\n"
-            f"🏆 Победитель: <b>{winner['username']}</b> (+{res['prize']}💰)\n"
-            f"💀 Проигравший: {loser['username']}",
-            reply_markup=main_menu_kb(),
+            f"🪙 Монетка упала на сторону: <b>{winner['username']}</b>!\n"
+            f"💰 Выигрыш: <b>+{res['prize']}💰</b>\n"
+            f"💀 Повержен: <b>{loser['username']}</b>",
+            reply_markup=main_menu_kb()
         )
     await callback.answer()
 
 
 # === КЕЙСЫ И ИНВЕНТАРЬ ===
-@router.callback_query(F.data == "game_cases")
-async def show_cases(callback: CallbackQuery):
-    text = "📦 <b>Кейсы с предметами:</b>\n\n"
-    for key, case in CASES.items():
-        text += f"{case['name']} — <b>{case['price']}💰</b>\n"
-    await callback.message.edit_text(text, reply_markup=cases_kb())
+@router.callback_query(F.data == "cases")
+async def show_cases_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📦 <b>МАГАЗИН КЕЙСОВ</b>\n\n"
+        "Выбери кейс для открытия и попытай удачу выбить редкий предмет!",
+        reply_markup=cases_kb()
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("open_case_"))
 async def open_case_handler(callback: CallbackQuery):
     case_key = callback.data.replace("open_case_", "")
-    if case_key not in CASES:
+    case_data = CASES.get(case_key)
+
+    if not case_data:
+        await callback.answer("❌ Кейс не найден!", show_alert=True)
         return
 
+    price = case_data["price"]
     user = await db.get_user(callback.from_user.id)
-    case = CASES[case_key]
 
-    if not user or user["balance"] < case["price"]:
-        await callback.answer(
-            f"❌ Недостаточно монет! Нужно {case['price']}💰", show_alert=True
-        )
+    if not user or user["balance"] < price:
+        await callback.answer(f"❌ Недостаточно денег! Нужно {price}💰", show_alert=True)
         return
 
-    await db.update_balance(callback.from_user.id, -case["price"])
-    res_case = open_case(case_key)
+    await db.update_balance(callback.from_user.id, -price)
+    item = open_case(case_key)
 
-    if len(res_case) == 3 and isinstance(res_case[0], str) and res_case[0] in RARITIES:
-        rarity, name, price = res_case
+    if item:
+        await db.add_item_to_inventory(callback.from_user.id, item["name"], item["price"])
+        rarity_info = RARITIES.get(item.get("rarity", "common"), {})
+        color_icon = rarity_info.get("icon", "⚪")
+
+        await callback.message.edit_text(
+            f"🎉 <b>ТЫ ОТКРЫЛ {case_data['name'].upper()}!</b>\n\n"
+            f"Вам выпал предмет: <b>{color_icon} {item['name']}</b>\n"
+            f"💵 Стоимость: <b>{item['price']}💰</b>\n\n"
+            f"Предмет сохранен в твой инвентарь!",
+            reply_markup=cases_kb()
+        )
     else:
-        name, rarity, price = res_case
+        await callback.answer("❌ Ошибка при открытии кейса!", show_alert=True)
 
-    await db.add_item(callback.from_user.id, name, rarity, price)
-
-    rarity_info = RARITIES.get(rarity, {"emoji": "📦", "name": rarity})
-    emoji = rarity_info.get("emoji", "📦")
-    r_name = rarity_info.get("name", rarity)
-
-    await callback.message.edit_text(
-        f"🎉 <b>Открыт {case['name']}!</b>\n\n"
-        f"Предмет: {emoji} <b>{name}</b>\n"
-        f"Редкость: <b>{r_name}</b>\n"
-        f"Стоимость предмета: <b>{price}💰</b>\n\n"
-        f"Предмет помещен в инвентарь!",
-        reply_markup=cases_kb(),
-    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "inventory")
 async def show_inventory(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    items = await db.get_inventory(user_id)
-    user = await db.get_user(user_id)
+    items = await db.get_inventory(callback.from_user.id)
+    user = await db.get_user(callback.from_user.id)
 
     if not items:
         await callback.message.edit_text(
-            "🎒 <b>Твой инвентарь пуст!</b>\nОткрывай кейсы в меню игр.",
-            reply_markup=main_menu_kb()
+            "🎒 <b>Твой инвентарь пуст.</b>\n"
+            "Открывай кейсы, чтобы получить редкие предметы!",
+            reply_markup=inventory_kb()
         )
         await callback.answer()
         return
 
-    text = f"🎒 <b>Инвентарь игрока {user['username']}:</b>\n\n"
-    kb = []
-    
-    for item in items[:10]:
-        item_id = item["id"]
-        name = item["name"]
-        price = item["price"]
-        rarity = item["rarity"]
-        text += f"• {name} ({rarity}) — <b>{price}💰</b>\n"
-        kb.append([InlineKeyboardButton(text=f"Продать: {name} ({price}💰)", callback_data=f"sell_item_{item_id}")])
+    total_val = sum(i.get("price", 0) for i in items)
+    text = f"🎒 <b>ТВОЙ ИНВЕНТАРЬ</b> (Всего: {len(items)} шт. | ~{total_val}💰)\n\n"
 
-    kb.append([InlineKeyboardButton(text="💸 Продать все", callback_data="sell_all_items")])
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+    for idx, item in enumerate(items[:10], start=1):
+        text += f"{idx}. <b>{item['name']}</b> — {item['price']}💰\n"
 
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    if len(items) > 10:
+        text += f"\n<i>... и еще {len(items) - 10} предметов.</i>"
+
+    await callback.message.edit_text(text, reply_markup=inventory_kb())
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("sell_item_"))
-async def sell_item_handler(callback: CallbackQuery):
-    item_id = int(callback.data.replace("sell_item_", ""))
-    sold = await db.sell_item(callback.from_user.id, item_id)
-    if sold:
-        await callback.answer(f"✅ Предмет успешно продан за {sold['price']}💰!", show_alert=True)
-    else:
-        await callback.answer("❌ Предмет не найден!", show_alert=True)
-    await show_inventory(callback)
+# === АДМИН КОМАНДА ДЛЯ ВЫДАЧИ БАЛАНСА ===
+@router.message(Command("give"))
+async def admin_give_money(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("⚠️ Использование: <code>/give [user_id] [amount]</code>")
+        return
+
+    target_id = int(parts[1])
+    amount = int(parts[2])
+
+    await db.update_balance(target_id, amount)
+    await message.answer(f"✅ Успешно начислено <b>{amount}💰</b> пользователю <code>{target_id}</code>")
 
 
-@router.callback_query(F.data == "sell_all_items")
-async def sell_all_items_handler(callback: CallbackQuery):
-    earned = await db.sell_all_items(callback.from_user.id)
-    if earned > 0:
-        await callback.answer(f"✅ Все предметы проданы на сумму {earned}💰!", show_alert=True)
-    else:
-        await callback.answer("❌ В инвентаре нет предметов для продажи!", show_alert=True)
-    await show_inventory(callback)
-
-
-# === ТОПЫ ИГРОКОВ ===
-@router.callback_query(F.data.startswith("top_"))
-async def show_top_callback(callback: CallbackQuery):
-    top_type = callback.data.replace("top_", "")
-    
-    if top_type == "balance":
-        top_list = await db.get_top_by_balance()
-        title = "💰 <b>Топ по балансу</b>"
-    elif top_type == "wins":
-        top_list = await db.get_top_by_wins() if hasattr(db, "get_top_by_wins") else []
-        title = "🏆 <b>Топ по победам</b>"
-    else:
-        top_list = await db.get_top_by_balance()
-        title = "🏆 <b>Рейтинг игроков</b>"
-
-    text = f"{title}\n\n"
-    for i, user in enumerate(top_list[:10], 1):
-        pref = f"{user['prefix']} " if user.get('prefix') else ""
-        val = user.get('balance', user.get('score', 0))
-        text += f"{i}. {pref}<b>{user['username']}</b> — {val}💰\n"
-
-    await callback.message.edit_text(text, reply_markup=tops_kb())
-    await callback.answer()
-
-
-# === ЗАПУСК БОТА ===
+# === ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ===
 async def main():
-    # Запуск фонового процесса рассылки рекламы
-    asyncio.create_task(ad_loop(bot))
+    logger.info("Запуск базы данных...")
+    await db.init_db()  # <-- Инициализируем таблицы базы данных
 
+    logger.info("Запуск фоновой рекламы...")
+    asyncio.create_task(ad_loop(bot))  # <-- Запуск фоновой рекламы
+
+    logger.info("Бот успешно запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Starting bot polling...")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен!")
