@@ -4,23 +4,23 @@ import uuid
 
 async def migrate():
     async with aiosqlite.connect("casino_bot.db") as db:
-        # РџСЂРѕРІРµСЂСЏРµРј СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёРµ РєРѕР»РѕРЅРєРё
+        # Проверяем существующие колонки
         cursor = await db.execute("PRAGMA table_info(users)")
         columns = [row[1] for row in await cursor.fetchall()]
         
-        # Р”РѕР±Р°РІР»СЏРµРј ref_code, РµСЃР»Рё РЅРµС‚
+        # Добавляем ref_code, если нет
         if 'ref_code' not in columns:
             await db.execute("ALTER TABLE users ADD COLUMN ref_code TEXT DEFAULT NULL")
-            print("вњ… Р”РѕР±Р°РІР»РµРЅР° РєРѕР»РѕРЅРєР° ref_code")
+            print("✅ Добавлена колонка ref_code")
             
-        # Р”РѕР±Р°РІР»СЏРµРј referrer_id, РµСЃР»Рё РЅРµС‚
+        # Добавляем referrer_id, если нет
         if 'referrer_id' not in columns:
             await db.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT NULL")
-            print("вњ… Р”РѕР±Р°РІР»РµРЅР° РєРѕР»РѕРЅРєР° referrer_id")
+            print("✅ Добавлена колонка referrer_id")
             
         await db.commit()
         
-        # Р“РµРЅРµСЂРёСЂСѓРµРј СЂРµС„РµСЂР°Р»СЊРЅС‹Рµ РєРѕРґС‹ РґР»СЏ СЃС‚Р°СЂС‹С… РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№
+        # Генерируем реферальные коды для старых пользователей
         cursor = await db.execute("SELECT tg_id FROM users WHERE ref_code IS NULL")
         old_users = await cursor.fetchall()
         
@@ -30,7 +30,7 @@ async def migrate():
             await db.execute("UPDATE users SET ref_code = ? WHERE tg_id = ?", (new_code, tg_id))
             
         await db.commit()
-        print(f"вњ… РЎРіРµРЅРµСЂРёСЂРѕРІР°РЅС‹ СЂРµС„РµСЂР°Р»СЊРЅС‹Рµ РєРѕРґС‹ РґР»СЏ {len(old_users)} СЃС‚Р°СЂС‹С… РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№")
-        print("рџЋ‰ РњРёРіСЂР°С†РёСЏ Р·Р°РІРµСЂС€РµРЅР°! РўРµРїРµСЂСЊ РјРѕР¶РЅРѕ Р·Р°РїСѓСЃРєР°С‚СЊ Р±РѕС‚Р°.")
+        print(f"✅ Сгенерированы реферальные коды для {len(old_users)} старых пользователей")
+        print("🎉 Миграция завершена! Теперь можно запускать бота.")
 
 asyncio.run(migrate())
