@@ -40,5 +40,5 @@ def open_case(case_key: str):
     case = CASES.get(case_key)
     if not case:
         return None
-    item = random.choice(case["items"])
-    return item  # Возвращает кортеж (название, редкость, цена)
+    name, rarity, price = random.choice(case["items"])
+    return {"name": name, "rarity": rarity, "price": price}

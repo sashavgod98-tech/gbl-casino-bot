@@ -8,26 +8,46 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
+    Message, PreCheckoutQuery,
 )
 from dotenv import load_dotenv
 
+from businesses import BUSINESS_CAP_HOURS, BUSINESSES
 from database import db
 from games import (
-    active_bw_games, active_crash_games, active_duels, cashout_crash,
-    create_bw_game, create_duel, get_waiting_bw_games, get_waiting_duels,
-    join_bw_game, join_duel, resolve_duel, run_crash_game,
+    active_bw_games, active_crash_games, active_dice_games, active_duels,
+    active_mines_games, calc_roulette_multiplier, cashout_crash,
+    cashout_mines, create_bw_game, create_dice_game, create_duel,
+    create_mines_game, format_roulette_outcome, get_mines_game,
+    get_waiting_bw_games, get_waiting_dice_games, get_waiting_duels,
+    join_bw_game, join_dice_game, join_duel, reveal_mines_cell,
+    roulette_number_emoji, roll_slots, rps_play, run_crash_game, spin_roulette,
 )
 from items import CASES, RARITIES, open_case
 from keyboards import (
-    bw_kb, cases_kb, crash_kb, duel_kb, inventory_kb, main_menu_kb,
-    prefix_color_kb, prefix_shop_kb, tops_kb,
+    business_menu_kb, bw_kb, cases_kb, crash_kb, dice_kb, donate_kb, duel_kb,
+    inventory_kb, main_menu_kb, mines_bet_kb, mines_board_kb, mines_diff_kb,
+    mines_result_kb, prefix_color_kb, prefix_shop_kb, roulette_again_kb,
+    roulette_amount_kb, roulette_menu_kb, roulette_number_amount_kb,
+    roulette_outcome_kb, rps_bet_kb, rps_choice_kb, slots_again_kb, slots_kb,
+    tops_kb,
 )
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+# === ДОНАТ ЗА TELEGRAM STARS ===
+# Курс для кастомной суммы: 1⭐ = 100💰
+STARS_TO_COINS_RATE = 100
+DONATE_PACKAGES = {
+    "small": {"stars": 50, "coins": 5500, "label": "50⭐ → 5,500💰"},
+    "medium": {"stars": 100, "coins": 12000, "label": "100⭐ → 12,000💰"},
+    "large": {"stars": 250, "coins": 32000, "label": "250⭐ → 32,000💰"},
+    "mega": {"stars": 500, "coins": 70000, "label": "500⭐ → 70,000💰"},
+}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,6 +100,20 @@ dp.include_router(router)
 
 class Form(StatesGroup):
     waiting_custom_crash = State()
+    waiting_custom_stars = State()
+    waiting_roulette_number = State()
+
+
+# === ПЛАВНОЕ ОТКРЫТИЕ МЕНЮ ===
+async def smooth_open(callback: CallbackQuery):
+    """Небольшая анимация загрузки перед сменой экрана, чтобы меню
+    открывалось плавно, а не резко перескакивало на новый текст."""
+    try:
+        for dots in (".", "..", "..."):
+            await callback.message.edit_text(f"⏳ Загрузка{dots}")
+            await asyncio.sleep(0.12)
+    except Exception:
+        pass
 
 
 # === АВТОМАТИЧЕСКАЯ РЕКЛАМА В БЕСЕДАХ (РАЗ В ЧАС) ===
@@ -110,6 +144,19 @@ async def ad_loop(bot_instance: Bot):
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+
+    # Обработка реферальной ссылки: /start ref_XXXXXXXX
+    parts = message.text.split(maxsplit=1) if message.text else []
+    if len(parts) > 1 and parts[1].startswith("ref_"):
+        ref_code = parts[1][4:]
+        try:
+            referrer_id = await db.apply_referral(message.from_user.id, ref_code)
+            if referrer_id:
+                await message.answer(
+                    "🎉 Ты перешёл по реферальной ссылке и получил бонус <b>500💰</b>!"
+                )
+        except Exception as e:
+            logger.error(f"Ошибка применения реферальной ссылки: {e}")
 
     user = await db.get_user(message.from_user.id)
     ref_link = await db.get_referral_link(message.from_user.id)
@@ -431,8 +478,9 @@ async def show_profile(callback: CallbackQuery | Message):
     )
 
     if isinstance(callback, CallbackQuery):
-        await callback.message.edit_text(text, reply_markup=main_menu_kb())
         await callback.answer()
+        await smooth_open(callback)
+        await callback.message.edit_text(text, reply_markup=main_menu_kb())
     else:
         await msg.answer(text, reply_markup=main_menu_kb())
 
@@ -442,8 +490,9 @@ async def show_profile(callback: CallbackQuery | Message):
 async def text_cmd_top(event: CallbackQuery | Message):
     text = "🏆 <b>Рейтинги сервера GBL Casino</b>\nВыбери нужную категорию ниже:"
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text, reply_markup=tops_kb())
         await event.answer()
+        await smooth_open(event)
+        await event.message.edit_text(text, reply_markup=tops_kb())
     else:
         await event.answer(text, reply_markup=tops_kb())
 
@@ -456,7 +505,8 @@ async def show_specific_top(callback: CallbackQuery):
     title_map = {
         "balance": "💰 ТОП ПО БАЛАНСУ",
         "won": "📈 ТОП ПО ВЫИГРЫШАМ",
-        "spent": "📉 ТОП ПО ПОТРАЧЕННОМУ"
+        "spent": "📉 ТОП ПО ПОТРАЧЕННОМУ",
+        "inventory": "🎒 ТОП ПО ИНВЕНТАРЮ",
     }
 
     text = f"<b>{title_map.get(top_type, '🏆 ТОП ИГРОКОВ')}</b>\n\n"
@@ -465,7 +515,7 @@ async def show_specific_top(callback: CallbackQuery):
     else:
         for idx, u in enumerate(top_users, start=1):
             pref = f"{u['prefix']} " if u.get('prefix') else ""
-            val = u.get(top_type, u.get('balance', 0))
+            val = u.get('value', 0)
             text += f"{idx}. <b>{pref}{u['username']}</b> — {val}💰\n"
 
     await callback.message.edit_text(text, reply_markup=tops_kb())
@@ -480,15 +530,23 @@ async def help_cmd(event: CallbackQuery | Message):
         "📈 <b>Краш</b> — растущий множитель с кастомными ставками!\n"
         "⚪/⚫ <b>Белое и Чёрное</b> — PvP угадайка с другими игроками\n"
         "⚔️ <b>Дуэль</b> — создай дуэль в меню или напиши <code>дуэль [сумма]</code> в ответ на сообщение человека!\n"
+        "🎲 <b>Кости</b> — PvP на костях, у кого выпадет больше — забирает банк!\n"
+        "🎰 <b>Слоты</b> — крути барабан и лови комбинации символов!\n"
+        "✊✋✌️ <b>КНБ</b> — камень-ножницы-бумага против бота\n"
+        "💣 <b>Мины</b> — открывай безопасные клетки и копи множитель, вовремя забирай выигрыш!\n"
+        "🎡 <b>Рулетка</b> — классика казино: цвет, дюжины, столбцы, чёт/нечет и ставки на число!\n"
         "📦 <b>Кейсы</b> — открывай и продавай лут\n"
+        "🏢 <b>Бизнес</b> — покупай заведения и собирай пассивный доход каждый час\n"
         "🎁 <b>Бонус</b> — 2,500💰 каждые 24 часа\n"
         "👑 <b>Префиксы</b> — выделись в общем рейтинге!\n"
         "💸 <b>Перевод денег</b> — ответь командой <code>передать 100</code> на сообщение игрока\n"
         "🎟 <b>Промокоды</b> — используй команду <code>/promo [код]</code> для получения бонусов!\n"
+        "⭐ <b>Донат за Stars</b> — пополняй баланс за Telegram Stars через кнопку в меню!\n"
     )
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text, reply_markup=main_menu_kb())
         await event.answer()
+        await smooth_open(event)
+        await event.message.edit_text(text, reply_markup=main_menu_kb())
     else:
         await event.answer(text, reply_markup=main_menu_kb())
 
@@ -496,10 +554,11 @@ async def help_cmd(event: CallbackQuery | Message):
 @router.callback_query(F.data == "back_menu")
 async def back_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    await callback.answer()
+    await smooth_open(callback)
     await callback.message.edit_text(
         "🎰 <b>Главное меню</b>\nВыбери режим:", reply_markup=main_menu_kb()
     )
-    await callback.answer()
 
 
 # === МАГАЗИН ПРЕФИКСОВ (ОБЫЧНЫЕ И ЦВЕТНЫЕ) ===
@@ -515,8 +574,9 @@ async def show_prefix_shop(callback: CallbackQuery):
         f"Выбери префикс для покупки:"
     )
 
-    await callback.message.edit_text(text, reply_markup=prefix_shop_kb())
     await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=prefix_shop_kb())
 
 
 @router.callback_query(F.data.startswith("buy_prefix_"))
@@ -609,12 +669,13 @@ async def daily_bonus(callback: CallbackQuery):
 # === КРАШ И СВОЯ СТАВКА ===
 @router.callback_query(F.data == "game_crash")
 async def show_crash(callback: CallbackQuery):
+    await callback.answer()
+    await smooth_open(callback)
     await callback.message.edit_text(
         "📈 <b>ИГРА КРАШ</b>\n\n"
         "Выбери стандартную ставку или введи свою кастомную сумму:",
         reply_markup=crash_kb("bet"),
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "crash_custom_bet")
@@ -716,8 +777,9 @@ async def show_bw_menu(callback: CallbackQuery):
         "4. Если соперник <b>не угадал</b> — банк забирает Создатель!\n\n"
         "Создай игру или выбери из списка активных:"
     )
-    await callback.message.edit_text(text, reply_markup=bw_kb())
     await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=bw_kb())
 
 
 @router.callback_query(F.data.startswith("bw_create_"))
@@ -884,12 +946,13 @@ async def bw_join_handler(callback: CallbackQuery):
 # === ДУЭЛИ (ОБЩИЕ) ===
 @router.callback_query(F.data == "game_duel")
 async def show_duel(callback: CallbackQuery):
+    await callback.answer()
+    await smooth_open(callback)
     await callback.message.edit_text(
         "⚔️ <b>PvP Дуэли (Монетка)</b>\n\n"
         "Создай общую дуэль для всех или ответь человеку на сообщение: <code>дуэль 100</code>", 
         reply_markup=duel_kb()
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("duel_create_"))
@@ -1000,6 +1063,731 @@ async def duel_join_handler(callback: CallbackQuery):
         await callback.answer("❌ Произошла ошибка при проведении дуэли.", show_alert=True)
         
     await callback.answer()
+
+
+# === КОСТИ (PvP) ===
+@router.callback_query(F.data == "game_dice")
+async def show_dice_menu(callback: CallbackQuery):
+    text = (
+        "🎲 <b>ИГРА «КОСТИ»</b>\n\n"
+        "Создай комнату со ставкой, дождись соперника — оба бросают кубик 1-6,"
+        " у кого больше, тот забирает банк! При ничьей — переброс.\n\n"
+        "Создай игру или выбери из списка активных:"
+    )
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=dice_kb())
+
+
+@router.callback_query(F.data.startswith("dice_create_"))
+async def dice_create_handler(callback: CallbackQuery):
+    bet = int(callback.data.replace("dice_create_", ""))
+    user = await db.get_user(callback.from_user.id)
+
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -bet)
+    game_id = create_dice_game(callback.from_user.id, user["username"], bet)
+
+    await callback.message.edit_text(
+        f"🎲 <b>Игра «Кости» #{game_id} создана!</b>\n"
+        f"Ставка: <b>{bet}💰</b>\n\n"
+        f"⏳ Ожидаем соперника...",
+        reply_markup=main_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dice_list")
+async def dice_list_handler(callback: CallbackQuery):
+    games = get_waiting_dice_games()
+    if not games:
+        await callback.message.edit_text(
+            "📋 <b>Нет активных игр «Кости»</b>\nСоздай свою!", reply_markup=dice_kb()
+        )
+        await callback.answer()
+        return
+
+    text = "📋 <b>Активные игры «Кости»:</b>\n\n"
+    kb = []
+    for g_id, g_data in list(games.items())[:5]:
+        text += f"🎲 Игра #{g_id} — {g_data['creator_name']} | Ставка: <b>{g_data['bet']}💰</b>\n"
+        kb.append([
+            InlineKeyboardButton(
+                text=f"🎲 Сыграть #{g_id} ({g_data['bet']}💰)", callback_data=f"dice_join_{g_id}"
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="game_dice")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dice_join_"))
+async def dice_join_handler(callback: CallbackQuery):
+    game_id = int(callback.data.replace("dice_join_", ""))
+    game = active_dice_games.get(game_id)
+
+    if not game:
+        await callback.answer("❌ Игра уже завершена или отменена!", show_alert=True)
+        return
+
+    if game.get("creator_id") == callback.from_user.id:
+        await callback.answer("❌ Нельзя играть с самим собой!", show_alert=True)
+        return
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < game["bet"]:
+        await callback.answer(f"❌ Нужно {game['bet']}💰", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -game["bet"])
+
+    res = join_dice_game(game_id, callback.from_user.id)
+    await db.update_balance(res["winner_id"], res["prize"])
+    winner = await db.get_user(res["winner_id"])
+    loser = await db.get_user(res["loser_id"])
+
+    text = (
+        f"🎲 <b>РЕЗУЛЬТАТ ИГРЫ «КОСТИ» #{game_id}!</b>\n\n"
+        f"Бросок создателя: <b>🎲 {res['creator_roll']}</b>\n"
+        f"Бросок соперника: <b>🎲 {res['opponent_roll']}</b>\n\n"
+        f"🏆 Победитель: <b>{winner['username']}</b> (+{res['prize']}💰)!\n"
+        f"💔 Проигравший: <b>{loser['username']}</b>"
+    )
+    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+
+    try:
+        await bot.send_message(res["winner_id"], f"🎉 Ты победил в игре «Кости»! Выиграно: +{res['prize']}💰")
+        await bot.send_message(res["loser_id"], "💀 К сожалению, ты проиграл в игре «Кости».")
+    except Exception:
+        pass
+
+    await callback.answer()
+
+
+# === СЛОТЫ ===
+@router.callback_query(F.data == "game_slots")
+async def show_slots_menu(callback: CallbackQuery):
+    text = (
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        "Три одинаковых символа — большой множитель!\n"
+        "Два одинаковых подряд — небольшой утешительный приз.\n\n"
+        "Выбери ставку:"
+    )
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=slots_kb())
+
+
+@router.callback_query(F.data.startswith("slots_spin_"))
+async def slots_spin_handler(callback: CallbackQuery):
+    bet = int(callback.data.replace("slots_spin_", ""))
+    user = await db.get_user(callback.from_user.id)
+
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -bet)
+    res = roll_slots(bet)
+
+    if res["win"] > 0:
+        await db.update_balance(callback.from_user.id, res["win"])
+        result_line = f"🎉 <b>Выигрыш: +{res['win']}💰</b> (x{res['multiplier']})"
+    else:
+        result_line = f"💀 <b>Не повезло, ставка {bet}💰 сгорела.</b>"
+
+    text = (
+        f"🎰 <b>[ {' | '.join(res['reels'])} ]</b>\n\n"
+        f"{result_line}"
+    )
+    await callback.message.edit_text(text, reply_markup=slots_again_kb(bet))
+    await callback.answer()
+
+
+# === КАМЕНЬ-НОЖНИЦЫ-БУМАГА ===
+@router.callback_query(F.data == "game_rps")
+async def show_rps_menu(callback: CallbackQuery):
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(
+        "✊✋✌️ <b>КАМЕНЬ-НОЖНИЦЫ-БУМАГА</b>\n\nСыграй против бота! Выбери ставку:",
+        reply_markup=rps_bet_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("rps_bet_"))
+async def rps_bet_handler(callback: CallbackQuery):
+    bet = int(callback.data.replace("rps_bet_", ""))
+    user = await db.get_user(callback.from_user.id)
+
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"✊✋✌️ <b>Ставка: {bet}💰</b>\n\nВыбери свой ход:", reply_markup=rps_choice_kb(bet)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rps_play_"))
+async def rps_play_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    bet = int(parts[2])
+    user_choice = parts[3]
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -bet)
+    res = rps_play(user_choice, bet)
+
+    if res["win"] > 0:
+        await db.update_balance(callback.from_user.id, res["win"])
+
+    if res["result"] == "win":
+        outcome = f"🎉 <b>Победа! +{res['win']}💰</b>"
+    elif res["result"] == "draw":
+        outcome = "🤝 <b>Ничья! Ставка возвращена.</b>"
+    else:
+        outcome = f"💀 <b>Поражение! Потеряно {bet}💰.</b>"
+
+    text = (
+        f"✊✋✌️ <b>РЕЗУЛЬТАТ</b>\n\n"
+        f"Твой ход: <b>{res['user_choice_label']}</b>\n"
+        f"Ход бота: <b>{res['bot_choice_label']}</b>\n\n"
+        f"{outcome}"
+    )
+    await callback.message.edit_text(text, reply_markup=rps_bet_kb())
+    await callback.answer()
+
+
+# === МИНЫ ===
+@router.callback_query(F.data == "game_mines")
+async def show_mines_menu(callback: CallbackQuery):
+    text = (
+        "💣 <b>МИНЫ</b>\n\n"
+        "Открывай безопасные клетки на поле 5×5, множитель растёт с каждой"
+        " клеткой! Чем больше мин, тем выше риск и награда. Забери выигрыш"
+        " в любой момент, пока не попал на мину.\n\n"
+        "Выбери ставку:"
+    )
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=mines_bet_kb())
+
+
+@router.callback_query(F.data.startswith("mines_bet_"))
+async def mines_bet_handler(callback: CallbackQuery):
+    bet = int(callback.data.replace("mines_bet_", ""))
+    user = await db.get_user(callback.from_user.id)
+
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"💣 <b>Ставка: {bet}💰</b>\n\nВыбери количество мин на поле:",
+        reply_markup=mines_diff_kb(bet),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mines_diff_"))
+async def mines_diff_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    bet = int(parts[2])
+    mines_count = int(parts[3])
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    if callback.from_user.id in active_mines_games:
+        await callback.answer("❌ У тебя уже есть активная игра в мины!", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -bet)
+    game = create_mines_game(callback.from_user.id, bet, mines_count)
+
+    await callback.message.edit_text(
+        f"💣 <b>МИНЫ</b> | Ставка: <b>{bet}💰</b> | Мин: <b>{mines_count}</b>\n"
+        f"Множитель: <b>x1.0</b> | Текущий выигрыш: <b>{bet}💰</b>\n\n"
+        f"Открывай клетки 🔲, чтобы поднять множитель!",
+        reply_markup=mines_board_kb(game),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mines_noop")
+async def mines_noop_handler(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mines_pick_"))
+async def mines_pick_handler(callback: CallbackQuery):
+    cell_index = int(callback.data.replace("mines_pick_", ""))
+    game = get_mines_game(callback.from_user.id)
+
+    if not game:
+        await callback.answer("❌ У тебя нет активной игры в мины!", show_alert=True)
+        return
+
+    res = reveal_mines_cell(callback.from_user.id, cell_index)
+
+    if res is None or res["status"] == "already_open":
+        await callback.answer()
+        return
+
+    if res["status"] == "mine":
+        del active_mines_games[callback.from_user.id]
+        await callback.message.edit_text(
+            f"💥 <b>БУМ! Ты попал на мину!</b>\n\nСтавка <b>{res['bet']}💰</b> потеряна.",
+            reply_markup=mines_result_kb(),
+        )
+        await callback.answer("💥 Мина!", show_alert=True)
+        return
+
+    if res["status"] == "cleared":
+        del active_mines_games[callback.from_user.id]
+        await db.update_balance(callback.from_user.id, res["win"])
+        await callback.message.edit_text(
+            f"🎉 <b>ВСЕ БЕЗОПАСНЫЕ КЛЕТКИ ОТКРЫТЫ!</b>\n\n"
+            f"Множитель: <b>x{res['multiplier']}</b>\n"
+            f"Выигрыш: <b>+{res['win']}💰</b>",
+            reply_markup=mines_result_kb(),
+        )
+        await callback.answer("🎉 Джекпот!", show_alert=True)
+        return
+
+    game = get_mines_game(callback.from_user.id)
+    await callback.message.edit_text(
+        f"💣 <b>МИНЫ</b> | Ставка: <b>{game['bet']}💰</b> | Мин: <b>{game['mines_count']}</b>\n"
+        f"Множитель: <b>x{res['multiplier']}</b> | Текущий выигрыш: <b>{res['win']}💰</b>\n\n"
+        f"Открывай клетки 🔲, чтобы поднять множитель, или забери выигрыш!",
+        reply_markup=mines_board_kb(game),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mines_cashout")
+async def mines_cashout_handler(callback: CallbackQuery):
+    win = cashout_mines(callback.from_user.id)
+    if win is None:
+        await callback.answer("❌ Нечего забирать!", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, win)
+    user = await db.get_user(callback.from_user.id)
+
+    await callback.message.edit_text(
+        f"💰 <b>ВЫИГРЫШ ЗАБРАН!</b>\n\n"
+        f"Заработано: <b>+{win}💰</b>\n"
+        f"Твой баланс: <b>{user['balance']}💰</b>",
+        reply_markup=mines_result_kb(),
+    )
+    await callback.answer()
+
+
+# === ДОНАТ ЗА TELEGRAM STARS ===
+@router.callback_query(F.data == "donate")
+async def show_donate_menu(callback: CallbackQuery):
+    text = (
+        "⭐ <b>ПОПОЛНЕНИЕ ЗА TELEGRAM STARS</b>\n\n"
+        "Покупай игровую валюту 💰 за звёзды Telegram!\n"
+        "Выбери пакет или укажи свою сумму:"
+    )
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=donate_kb())
+
+
+@router.callback_query(F.data.startswith("donate_") & ~F.data.in_({"donate_custom"}))
+async def donate_package_handler(callback: CallbackQuery):
+    package_key = callback.data.replace("donate_", "")
+    package = DONATE_PACKAGES.get(package_key)
+
+    if not package:
+        await callback.answer("❌ Пакет не найден!", show_alert=True)
+        return
+
+    await bot.send_invoice(
+        chat_id=callback.message.chat.id,
+        title="Пополнение баланса GBL Casino",
+        description=f"Пополнение баланса на {package['coins']}💰 игровой валюты",
+        payload=f"topup_{package['coins']}_{callback.from_user.id}",
+        provider_token="",  # для Telegram Stars всегда пустая строка
+        currency="XTR",
+        prices=[LabeledPrice(label=package["label"], amount=package["stars"])],
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "donate_custom")
+async def donate_custom_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_custom_stars)
+    await callback.message.edit_text(
+        "✍️ <b>Введи количество Stars⭐, которое хочешь потратить:</b>\n\n"
+        f"Курс: <b>1⭐ = {STARS_TO_COINS_RATE}💰</b>\n"
+        "Пример: <code>150</code>"
+    )
+    await callback.answer()
+
+
+@router.message(Form.waiting_custom_stars)
+async def donate_custom_process(message: Message, state: FSMContext):
+    await state.clear()
+
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ Количество Stars должно быть целым положительным числом!")
+        return
+
+    stars = int(message.text)
+    if stars <= 0:
+        await message.answer("❌ Количество Stars должно быть больше 0!")
+        return
+
+    coins = stars * STARS_TO_COINS_RATE
+
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title="Пополнение баланса GBL Casino",
+        description=f"Пополнение баланса на {coins}💰 игровой валюты",
+        payload=f"topup_{coins}_{message.from_user.id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{stars}⭐ → {coins}💰", amount=stars)],
+    )
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    # Подтверждаем платёж — обязательно ответить в течение 10 секунд
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payment = message.successful_payment
+    try:
+        coins = int(payment.invoice_payload.split("_")[1])
+    except (IndexError, ValueError):
+        coins = payment.total_amount * STARS_TO_COINS_RATE  # запасной вариант
+
+    await db.update_balance(message.from_user.id, coins)
+    user = await db.get_user(message.from_user.id)
+
+    await message.answer(
+        f"✅ <b>Оплата прошла успешно!</b>\n\n"
+        f"⭐ Потрачено: <b>{payment.total_amount}</b> Stars\n"
+        f"💰 Начислено: <b>+{coins}💰</b>\n"
+        f"💳 Текущий баланс: <b>{user['balance']}💰</b>",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# === КЕЙСЫ ===
+@router.callback_query(F.data == "cases")
+async def show_cases_menu(callback: CallbackQuery):
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(
+        "📦 <b>МАГАЗИН КЕЙСОВ</b>\n\n"
+        "Испытай удачу и получи крутой дроп!\n"
+        "Выбери кейс для открытия:",
+        reply_markup=cases_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("open_case_"))
+async def process_open_case(callback: CallbackQuery):
+    case_id = callback.data.replace("open_case_", "")
+    case_data = CASES.get(case_id)
+
+    if not case_data:
+        await callback.answer("❌ Кейс не найден!", show_alert=True)
+        return
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < case_data["price"]:
+        await callback.answer(
+            f"❌ Недостаточно средств! Кейс стоит {case_data['price']}💰", show_alert=True
+        )
+        return
+
+    await db.update_balance(callback.from_user.id, -case_data["price"])
+
+    drop = open_case(case_id)
+    await db.add_item_to_inventory(
+        callback.from_user.id, drop["name"], drop["rarity"], drop["price"]
+    )
+
+    rarity_color = RARITIES.get(drop["rarity"], {}).get("emoji", "⬜")
+
+    text = (
+        f"📦 <b>Ты открыл {case_data['name']}!</b>\n\n"
+        f"Тебе выпало:\n"
+        f"{rarity_color} <b>{drop['name']}</b>\n"
+        f"💰 Стоимость: <b>{drop['price']}💰</b>\n\n"
+        f"Предмет добавлен в твой инвентарь!"
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎒 В инвентарь", callback_data="inventory")],
+                [InlineKeyboardButton(text="📦 Открыть ещё раз", callback_data=f"open_case_{case_id}")],
+                [InlineKeyboardButton(text="⬅️ К кейсам", callback_data="cases")],
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+# === ИНВЕНТАРЬ ===
+@router.callback_query(F.data == "inventory")
+async def show_inventory(callback: CallbackQuery):
+    items = await db.get_inventory(callback.from_user.id)
+
+    if not items:
+        text = "🎒 <b>ТВОЙ ИНВЕНТАРЬ ПУСТ</b>\n\nОткрывай кейсы, чтобы получить предметы!"
+    else:
+        total_value = sum(i["item_price"] for i in items)
+        text = f"🎒 <b>ТВОЙ ИНВЕНТАРЬ</b>\n\nПредметов: <b>{len(items)}</b> | Общая стоимость: <b>{total_value}💰</b>\n\n"
+        for i in items[:20]:
+            emoji = RARITIES.get(i["item_rarity"], {}).get("emoji", "⬜")
+            text += f"{emoji} <b>{i['item_name']}</b> — {i['item_price']}💰\n"
+        if len(items) > 20:
+            text += f"\n... и ещё {len(items) - 20} предметов"
+
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=inventory_kb(items))
+
+
+@router.callback_query(F.data == "sell_all_items")
+async def sell_all_items_handler(callback: CallbackQuery):
+    total = await db.sell_all_items(callback.from_user.id)
+
+    if not total:
+        await callback.answer("❌ У тебя нет предметов для продажи!", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"💥 <b>Все предметы проданы!</b>\n\nПолучено: <b>+{total}💰</b>",
+        reply_markup=main_menu_kb(),
+    )
+    await callback.answer(f"Продано на {total}💰!")
+
+
+# === РУЛЕТКА ===
+@router.callback_query(F.data == "game_roulette")
+async def show_roulette_menu(callback: CallbackQuery):
+    text = (
+        "🎡 <b>РУЛЕТКА</b>\n\n"
+        "Классическая европейская рулетка — числа от 0 до 36.\n"
+        "Выбери тип ставки:\n\n"
+        "🎨 Цвет — x2\n"
+        "🔢 Дюжины / 📊 Столбцы — x3\n"
+        "⚖️ Чёт/Нечет, диапазон — x2\n"
+        "🎯 Точное число — x36\n\n"
+        "⚠️ При выпадении 0 все ставки, кроме ставки на число 0, проигрывают."
+    )
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=roulette_menu_kb())
+
+
+@router.callback_query(F.data.startswith("roul_cat_"))
+async def roulette_category_handler(callback: CallbackQuery):
+    category = callback.data.replace("roul_cat_", "")
+    await callback.message.edit_text(
+        f"🎡 <b>Рулетка — выбери исход</b>\n\nКатегория ставки выбрана. Теперь выбери конкретный вариант:",
+        reply_markup=roulette_outcome_kb(category),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("roul_outcome_"))
+async def roulette_outcome_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    category = parts[2]
+    outcome = "_".join(parts[3:])
+    label = format_roulette_outcome(category, outcome)
+
+    await callback.message.edit_text(
+        f"🎡 <b>Ставка: {label}</b>\n\nВыбери сумму ставки:",
+        reply_markup=roulette_amount_kb(category, outcome),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "roul_number_start")
+async def roulette_number_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_roulette_number)
+    await callback.message.edit_text(
+        "✍️ <b>Введи число от 0 до 36 текстом в чат:</b>\n\n"
+        "Выигрыш при точном попадании — x36!"
+    )
+    await callback.answer()
+
+
+@router.message(Form.waiting_roulette_number)
+async def roulette_number_process(message: Message, state: FSMContext):
+    await state.clear()
+
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ Нужно отправить целое число от 0 до 36!")
+        return
+
+    number = int(message.text)
+    if not (0 <= number <= 36):
+        await message.answer("❌ Число должно быть в диапазоне от 0 до 36!")
+        return
+
+    await message.answer(
+        f"🎯 <b>Ставка на число {number}</b>\n\nВыбери сумму ставки:",
+        reply_markup=roulette_number_amount_kb(number),
+    )
+
+
+@router.callback_query(F.data.startswith("roul_spin_"))
+async def roulette_spin_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    category = parts[2]
+    outcome = parts[3]
+    bet = int(parts[4])
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < bet:
+        await callback.answer(f"❌ Нужно {bet}💰", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -bet)
+
+    number, color = spin_roulette()
+    multiplier = calc_roulette_multiplier(category, outcome, number, color)
+    win = bet * multiplier
+
+    if win > 0:
+        await db.update_balance(callback.from_user.id, win)
+        result_line = f"🎉 <b>Победа! +{win}💰</b> (x{multiplier})"
+    else:
+        result_line = f"💀 <b>Не повезло, ставка {bet}💰 сгорела.</b>"
+
+    bet_label = format_roulette_outcome(category, outcome)
+    number_emoji = roulette_number_emoji(number)
+
+    text = (
+        f"🎡 <b>РЕЗУЛЬТАТ РУЛЕТКИ</b>\n\n"
+        f"Твоя ставка: <b>{bet_label}</b> ({bet}💰)\n"
+        f"Выпало число: <b>{number_emoji} {number}</b>\n\n"
+        f"{result_line}"
+    )
+    await callback.message.edit_text(text, reply_markup=roulette_again_kb())
+    await callback.answer()
+
+
+# === БИЗНЕСЫ (ПАССИВНЫЙ ДОХОД) ===
+async def _build_business_status(user_id: int):
+    owned = await db.get_user_businesses(user_id)
+    status = []
+    for key, data in BUSINESSES.items():
+        is_owned = key in owned
+        pending = 0
+        if is_owned:
+            pending = await db.get_pending_business_income(
+                user_id, key, data["hourly"], BUSINESS_CAP_HOURS
+            )
+        status.append({
+            "key": key,
+            "name": data["name"],
+            "price": data["price"],
+            "hourly": data["hourly"],
+            "owned": is_owned,
+            "pending": pending,
+        })
+    return status
+
+
+@router.callback_query(F.data == "business_menu")
+async def show_business_menu(callback: CallbackQuery):
+    status = await _build_business_status(callback.from_user.id)
+    text = (
+        "🏢 <b>ТВОЙ БИЗНЕС</b>\n\n"
+        "Покупай заведения — они приносят пассивный доход каждый час!\n"
+        f"Доход копится, пока тебя нет, но не больше {BUSINESS_CAP_HOURS} часов — "
+        "не забывай заходить и забирать прибыль.\n\n"
+        "Твои заведения:"
+    )
+    await callback.answer()
+    await smooth_open(callback)
+    await callback.message.edit_text(text, reply_markup=business_menu_kb(status))
+
+
+@router.callback_query(F.data.startswith("biz_buy_"))
+async def business_buy_handler(callback: CallbackQuery):
+    key = callback.data.replace("biz_buy_", "")
+    data = BUSINESSES.get(key)
+    if not data:
+        await callback.answer("❌ Бизнес не найден!", show_alert=True)
+        return
+
+    user = await db.get_user(callback.from_user.id)
+    if not user or user["balance"] < data["price"]:
+        await callback.answer(f"❌ Нужно {data['price']}💰", show_alert=True)
+        return
+
+    bought = await db.buy_business(callback.from_user.id, key)
+    if not bought:
+        await callback.answer("❌ У тебя уже есть этот бизнес!", show_alert=True)
+        return
+
+    await db.update_balance(callback.from_user.id, -data["price"])
+    await callback.answer(f"🎉 Куплено: {data['name']}!", show_alert=True)
+
+    status = await _build_business_status(callback.from_user.id)
+    await callback.message.edit_text(
+        "🏢 <b>ТВОЙ БИЗНЕС</b>\n\nТвои заведения:",
+        reply_markup=business_menu_kb(status),
+    )
+
+
+@router.callback_query(F.data.startswith("biz_collect_"))
+async def business_collect_handler(callback: CallbackQuery):
+    key = callback.data.replace("biz_collect_", "")
+    data = BUSINESSES.get(key)
+    if not data:
+        await callback.answer("❌ Бизнес не найден!", show_alert=True)
+        return
+
+    income = await db.collect_business(
+        callback.from_user.id, key, data["hourly"], BUSINESS_CAP_HOURS
+    )
+    if income <= 0:
+        await callback.answer("⏳ Доход ещё не накопился, загляни позже!", show_alert=True)
+        return
+
+    await callback.answer(f"💰 Собрано: +{income}💰!", show_alert=True)
+
+    status = await _build_business_status(callback.from_user.id)
+    await callback.message.edit_text(
+        "🏢 <b>ТВОЙ БИЗНЕС</b>\n\nТвои заведения:",
+        reply_markup=business_menu_kb(status),
+    )
+
+
+@router.callback_query(F.data == "biz_noop")
+async def business_noop_handler(callback: CallbackQuery):
+    await callback.answer("⏳ Доход ещё копится, загляни позже!")
 
 
 # === ЗАПУСК БОТА И БАЗЫ ДАННЫХ ===
